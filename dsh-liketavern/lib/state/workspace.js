@@ -1,0 +1,410 @@
+/**
+ * 角色工作区管理（plan 3.12.1）。
+ *
+ * 目录结构：<dataRoot>/<cardId>/{card.json, card.png?, assets/, memory/archive/,
+ * state/wal/, journal.md, index.json}。本模块各函数的 dataRoot 形参即角色库目录
+ * （<插件数据根>/characters，见 node/paths.ts 与 node/state.ts 的调用方式）。
+ * 一切文件写入经 WorkspaceFs（本模块内均为导入期写入，wal 传 null）；
+ * 例外：deleteCharacter 的整目录 rm -rf（WorkspaceFs 无递归删除语义）与
+ * 角色列举的本层 readdir（WorkspaceFs.list 只列文件、给不出目录名）。
+ * 收纳箱只在角色根写 `.archive.json` 原子标记，不搬动工作区：已绑定会话
+ * 仍可以按原 cardId/storyId 读取剧情，而新会话的普通列表不再暴露已收纳角色。
+ */
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { readdir, rename, rm } from 'node:fs/promises';
+import { join } from 'node:path';
+import { compileCardRegexScripts } from '../core/regex.js';
+import { estimateTokens } from '../core/tokenize.js';
+import { cardToStJson, embedCardInPng, hydrateStoredCard, normalizeBook, withoutEmbeddedCharacterBook } from './card.js';
+import { WorkspaceFs } from './workspaceFs.js';
+import { withWorkspaceLock } from './workspaceLock.js';
+/** 从 extensions 提取剧情投影。形状不符一律 undefined —— 元数据异常不能让整张卡从列表消失。 */
+function gymSummaryOf(card) {
+    const raw = card.extensions?.['tavern-gym'];
+    if (typeof raw !== 'object' || raw === null || Array.isArray(raw))
+        return undefined;
+    const record = raw;
+    const list = record.protagonists;
+    if (!Array.isArray(list))
+        return undefined;
+    const protagonistNames = [];
+    for (const item of list) {
+        if (typeof item !== 'object' || item === null || Array.isArray(item))
+            continue;
+        const name = item.name;
+        if (typeof name === 'string' && name !== '')
+            protagonistNames.push(name);
+    }
+    if (protagonistNames.length === 0)
+        return undefined;
+    const first = list[0];
+    const baseline = typeof first === 'object' && first !== null && !Array.isArray(first)
+        ? first.baseline
+        : undefined;
+    const grade = typeof baseline === 'object' && baseline !== null && !Array.isArray(baseline)
+        ? baseline.grade
+        : undefined;
+    // 关卡链：形状不符的条目直接跳过，缺字段用空值补，不影响整卡列出。
+    const phases = [];
+    if (Array.isArray(record.phases)) {
+        for (const item of record.phases) {
+            if (typeof item !== 'object' || item === null || Array.isArray(item))
+                continue;
+            const phase = item;
+            const tasks = Array.isArray(phase.tasks) ? phase.tasks.length : 0;
+            phases.push({
+                id: typeof phase.id === 'number' && Number.isSafeInteger(phase.id) ? phase.id : phases.length + 1,
+                name: typeof phase.name === 'string' ? phase.name : '',
+                window: typeof phase.window === 'string' ? phase.window : '',
+                taskCount: typeof phase.taskCount === 'number' && Number.isSafeInteger(phase.taskCount)
+                    ? phase.taskCount
+                    : tasks,
+            });
+        }
+    }
+    return {
+        scenarioId: typeof record.scenarioId === 'string' ? record.scenarioId : '',
+        role: typeof record.role === 'string' ? record.role : '',
+        protagonistCount: protagonistNames.length,
+        protagonistNames,
+        grade: typeof grade === 'string' && grade !== '' ? grade : null,
+        premise: typeof record.premise === 'string' ? record.premise : '',
+        fidelity: typeof record.fidelity === 'string' ? record.fidelity : '',
+        kind: record.version === 3 || record.role === 'history' ? 'history' : 'contemporary',
+        period: typeof record.period === 'string' ? record.period : '',
+        phases,
+    };
+}
+export const CHARACTER_ARCHIVE_FILE = '.archive.json';
+// ---------------------------------------------------------------------------
+// cardId
+// ---------------------------------------------------------------------------
+/**
+ * cardId 必须是 characters/ 下的单层目录名。
+ *
+ * 不能只拦截 `..`：在 Windows 上 `join(dataRoot, '.')` 会直接指向角色库根目录，
+ * 若随后执行递归删除，会把全部角色一并删掉。这里同时拒绝路径分隔符、首尾点与
+ * 连续点，保留旧版可能使用的字母、数字、下划线、连字符、中文和中间单点。
+ * 另外拒绝 Windows 保留设备名（CON/NUL/COM1…，含带任意扩展段的形态如 CON.card）：
+ * RPC 直传这类 id 时 join 会解析为设备路径，后续 mkdir/rm 行为异常。
+ */
+const WINDOWS_RESERVED_NAME = /^(?:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CLOCK\$)$/i;
+export function isValidCardId(cardId) {
+    if (WINDOWS_RESERVED_NAME.test(cardId.split('.')[0] ?? ''))
+        return false;
+    return /^[A-Za-z0-9_一-龥-]+(?:\.[A-Za-z0-9_一-龥-]+)*$/.test(cardId);
+}
+/** 非法 cardId 统一抛错，供所有会创建/删除工作区句柄的入口复用。 */
+export function assertValidCardId(cardId) {
+    if (!isValidCardId(cardId))
+        throw new Error(`非法的角色 ID: ${cardId}`);
+}
+/** 名称净化：小写，非 [a-z0-9 一-龥] 归并为 '-'，去首尾连字符，限长 24。 */
+function sanitizeCardName(name) {
+    return name
+        .toLowerCase()
+        .replace(/[^a-z0-9一-龥]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 24)
+        .replace(/-+$/g, '');
+}
+/** 角色 ID：净化名 + '-' + sha1(name + 随机字节) 前 8 位（同名片互不覆盖）。 */
+export function newCardId(name) {
+    const base = sanitizeCardName(name) || 'card';
+    const suffix = createHash('sha1').update(name).update(randomBytes(8)).digest('hex').slice(0, 8);
+    return `${base}-${suffix}`;
+}
+/**
+ * 导入角色卡为独立工作区：建目录结构，落盘 card.json（剔除 pngBytes、保留 raw）、
+ * card.png（若有字节）、assets/character-book.json（若有内嵌书且未跳过）、
+ * assets/regex-scripts.json（compileCardRegexScripts 编译产物，默认不启用）、
+ * journal.md（不存在则建空文件）与初始 index.json。
+ */
+export async function importCard(dataRoot, card, opts) {
+    const importWorldBook = opts?.importWorldBook !== false;
+    const cleanedCard = importWorldBook ? card : withoutEmbeddedCharacterBook(card);
+    // PNG 本身仍是角色卡数据载体；若原样存 card.png，跳过的世界书会继续留在 chara/ccv3 chunk。
+    // 用来源感知清洗后的 raw 重嵌，既保留厂商 envelope/spec_version，又只替换卡数据 chunk；
+    // 无 raw 对象时才退回标准导出。无 IEND 的坏图明确拒绝而不泄漏原书。
+    const cleanedPngMetadata = typeof cleanedCard.raw === 'object' && cleanedCard.raw !== null && !Array.isArray(cleanedCard.raw)
+        ? cleanedCard.raw
+        : cardToStJson(cleanedCard);
+    const importedCard = !importWorldBook && cleanedCard.pngBytes
+        ? { ...cleanedCard, pngBytes: embedCardInPng(cleanedCard.pngBytes, cleanedPngMetadata, cleanedCard.spec) }
+        : cleanedCard;
+    const cardId = newCardId(card.name);
+    const root = join(dataRoot, cardId);
+    // 点号前缀不是合法 cardId，列表和 RPC 均看不到准备中的工作区。
+    const staging = join(dataRoot, `.importing-${randomUUID()}`);
+    const fs = new WorkspaceFs(staging, null);
+    try {
+        await fs.ensureDir('assets');
+        await fs.ensureDir('memory/archive');
+        await fs.ensureDir('state/wal');
+        const { pngBytes, ...cardJson } = importedCard;
+        await fs.writeText('card.json', JSON.stringify(cardJson, null, 2) + '\n');
+        if (pngBytes)
+            await fs.writeBytes('card.png', pngBytes);
+        if (importWorldBook && importedCard.characterBook && importedCard.characterBook.entries.length > 0) {
+            const book = { name: importedCard.characterBook.name ?? importedCard.name, entries: importedCard.characterBook.entries };
+            await fs.writeText('assets/character-book.json', JSON.stringify(book, null, 2) + '\n');
+        }
+        const rules = compileCardRegexScripts(importedCard.regexScripts, cardId);
+        await fs.writeText('assets/regex-scripts.json', JSON.stringify(rules, null, 2) + '\n');
+        if ((await fs.readText('journal.md')) === null)
+            await fs.writeText('journal.md', '');
+        await rebuildIndex(fs, estimateTokens);
+        await rename(staging, root);
+        return {
+            cardId,
+            root,
+            card: importedCard,
+        };
+    }
+    finally {
+        // 只移除本次临时目录；发布成功后它已不存在，永不清理正式角色目录。
+        await rm(staging, { recursive: true, force: true });
+    }
+}
+/**
+ * 列出全部角色（读各 card.json 的 name 与 card.png 存在性）；损坏目录容错跳过。
+ * 只 readdir characters/ 本层、逐目录读 card.json 探测：卡目录约定为单层
+ * characters/<cardId>/card.json，递归遍历会把每个角色的 memory/archive/、
+ * state/wal/ 整棵走完（数据积累后设置面板打开随之变慢），这里不做任何递归。
+ */
+async function characterDirectoryIds(dataRoot) {
+    let entries;
+    try {
+        entries = await readdir(dataRoot, { withFileTypes: true });
+    }
+    catch (error) {
+        // 角色库目录尚未创建（从未导入过卡）按空列表处理，与旧递归 list 的 ENOENT 口径一致
+        if (error.code === 'ENOENT')
+            return [];
+        throw error;
+    }
+    // 排序保持旧实现按 cardId 字典序的观测口径，不依赖 readdir 返回顺序
+    return entries
+        .filter((e) => e.isDirectory())
+        .map((e) => e.name)
+        .filter(isValidCardId)
+        .sort();
+}
+/** 读收纳标记；文件损坏时明确报错，不把本应隐藏的角色误当活动角色。 */
+export async function readCharacterArchiveMetadata(dataRoot, cardId) {
+    assertValidCardId(cardId);
+    const raw = await new WorkspaceFs(join(dataRoot, cardId), null).readText(CHARACTER_ARCHIVE_FILE);
+    if (raw === null)
+        return null;
+    let parsed;
+    try {
+        parsed = JSON.parse(raw);
+    }
+    catch {
+        throw new Error(`角色 ${cardId} 的收纳标记损坏`);
+    }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed))
+        throw new Error(`角色 ${cardId} 的收纳标记损坏`);
+    const record = parsed;
+    if (record.version !== 1 || typeof record.archivedAt !== 'string' || !record.archivedAt.trim()
+        || !Number.isFinite(Date.parse(record.archivedAt))) {
+        throw new Error(`角色 ${cardId} 的收纳标记损坏`);
+    }
+    return { version: 1, archivedAt: record.archivedAt };
+}
+/** 单次读取列表摘要，供活动列表与收纳箱共用。 */
+async function characterSummary(dataRoot, cardId) {
+    const ws = await loadCharacter(dataRoot, cardId);
+    if (!ws)
+        return null;
+    const fs = new WorkspaceFs(ws.root, null);
+    const bookName = ws.card.characterBook?.name ?? null;
+    const entryCount = Array.isArray(ws.card.characterBook?.entries) ? ws.card.characterBook.entries.length : 0;
+    return {
+        cardId,
+        name: ws.card.name,
+        // 旧版/手工维护的 card.json 不保证新摘要字段的形状；元数据异常不能让整张卡从列表消失。
+        creator: typeof ws.card.creator === 'string' ? ws.card.creator : '',
+        tags: Array.isArray(ws.card.tags) ? ws.card.tags.filter((tag) => typeof tag === 'string') : [],
+        hasAvatar: await fs.exists('card.png'),
+        hasCharacterBook: entryCount > 0 || (await fs.exists('assets/character-book.json')),
+        characterBookName: bookName,
+        characterBookEntryCount: entryCount,
+        gym: gymSummaryOf(ws.card),
+    };
+}
+export async function listCharacters(dataRoot) {
+    const cardIds = await characterDirectoryIds(dataRoot);
+    const out = [];
+    for (const cardId of cardIds) {
+        try {
+            if (await readCharacterArchiveMetadata(dataRoot, cardId))
+                continue;
+            // card.json 缺失/损坏时 characterSummary 返回 null，即「探测」口径
+            const summary = await characterSummary(dataRoot, cardId);
+            if (summary)
+                out.push(summary);
+        }
+        catch {
+            continue; // 坏目录跳过
+        }
+    }
+    return out;
+}
+/**
+ * 列出收纳箱角色。标记 JSON 损坏时仍依「文件存在」收纳，并用 mtime 兜底时间：
+ * 这样角色不会误回活动库，也不会从两个列表同时消失，用户仍能点击恢复清掉坏标记。
+ */
+export async function listArchivedCharacters(dataRoot) {
+    const out = [];
+    for (const cardId of await characterDirectoryIds(dataRoot)) {
+        try {
+            const root = join(dataRoot, cardId);
+            const fs = new WorkspaceFs(root, null);
+            let archivedAt;
+            try {
+                const archived = await readCharacterArchiveMetadata(dataRoot, cardId);
+                if (!archived)
+                    continue;
+                archivedAt = archived.archivedAt;
+            }
+            catch {
+                const marker = await fs.stat(CHARACTER_ARCHIVE_FILE);
+                if (!marker)
+                    continue;
+                archivedAt = new Date(marker.mtimeMs).toISOString();
+            }
+            const summary = await characterSummary(dataRoot, cardId);
+            if (summary)
+                out.push({ ...summary, archivedAt });
+        }
+        catch {
+            continue;
+        }
+    }
+    return out;
+}
+/** 读取角色工作区；card.json 缺失或损坏返回 null。 */
+export async function loadCharacter(dataRoot, cardId) {
+    if (!isValidCardId(cardId))
+        return null;
+    const root = join(dataRoot, cardId);
+    const fs = new WorkspaceFs(root, null);
+    const text = await fs.readText('card.json');
+    if (text === null)
+        return null;
+    let parsed;
+    try {
+        parsed = JSON.parse(text);
+    }
+    catch {
+        return null;
+    }
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed))
+        return null;
+    const record = parsed;
+    // pngBytes 不持久化于 card.json（头像字节在 card.png），读回恒为 null
+    const card = hydrateStoredCard(record);
+    // 旧导入或 card.json 缺 characterBook 时，从落盘的内嵌书补回
+    if (!Array.isArray(card.characterBook?.entries) || card.characterBook.entries.length === 0) {
+        const bookText = await fs.readText('assets/character-book.json');
+        if (bookText !== null) {
+            try {
+                const book = normalizeBook(JSON.parse(bookText));
+                if (book)
+                    card.characterBook = book;
+            }
+            catch {
+                // 坏文件忽略
+            }
+        }
+    }
+    return { cardId, root, card };
+}
+/**
+ * 将角色收纳：只原子写入根级标记，不搬动工作区，因此剧情、WAL 和历史绑定仍按
+ * 原路径可用。重复收纳保留首次 archivedAt，避免列表顺序因重试抖动。
+ */
+export async function archiveCharacter(dataRoot, cardId) {
+    assertValidCardId(cardId);
+    const root = join(dataRoot, cardId);
+    return withWorkspaceLock(root, async () => {
+        if (!(await loadCharacter(dataRoot, cardId)))
+            throw new Error(`角色 ${cardId} 不存在`);
+        const current = await readCharacterArchiveMetadata(dataRoot, cardId);
+        if (current)
+            return current;
+        const metadata = { version: 1, archivedAt: new Date().toISOString() };
+        await new WorkspaceFs(root, null).writeText(CHARACTER_ARCHIVE_FILE, JSON.stringify(metadata, null, 2) + '\n');
+        return metadata;
+    });
+}
+/** 恢复收纳角色；对已在活动库的角色幂等，不修改任何剧情文件。 */
+export async function restoreCharacter(dataRoot, cardId) {
+    assertValidCardId(cardId);
+    const root = join(dataRoot, cardId);
+    await withWorkspaceLock(root, async () => {
+        if (!(await loadCharacter(dataRoot, cardId)))
+            throw new Error(`角色 ${cardId} 不存在`);
+        await new WorkspaceFs(root, null).delete(CHARACTER_ARCHIVE_FILE);
+    });
+}
+/** 删除角色工作区整目录（rm -rf；本模块唯一直接使用 node:fs 的位置）。 */
+export async function deleteCharacter(dataRoot, cardId) {
+    assertValidCardId(cardId);
+    await rm(join(dataRoot, cardId), { recursive: true, force: true });
+}
+// ---------------------------------------------------------------------------
+// index.json 维护
+// ---------------------------------------------------------------------------
+/** md 摘要：跳过 YAML frontmatter 后首个非空行的前 60 字；空文件返回空串。 */
+function summarizeMarkdown(content) {
+    const lines = content.split('\n');
+    let i = 0;
+    if (lines[0]?.trim() === '---') {
+        i = 1;
+        while (i < lines.length && lines[i].trim() !== '---')
+            i++;
+        i++; // 跳过结束分隔线（无结束线则 i 越界，循环自然为空）
+    }
+    for (; i < lines.length; i++) {
+        const line = lines[i].trim();
+        if (line !== '')
+            return line.slice(0, 60);
+    }
+    return '';
+}
+/**
+ * 重建 index.json：扫描 memory/*.md（不含 archive 子目录）、state/world-delta.jsonl 与
+ * journal.md，每个文件记录 {path, summary, tokens}（tokens 由注入的估算函数计算）。
+ */
+export async function rebuildIndex(fs, estimateTokens) {
+    // 索引是多文件派生视图；扫描到写回必须同占工作区锁，不能让并发编辑插在两者之间。
+    await withWorkspaceLock(fs.root, async () => {
+        const files = [];
+        // 非递归列举：archive/ 不进清单，递归走一遍再丢掉会让每次写入后的重建随归档量变慢。
+        const memoryFiles = await fs.list('memory', { recursive: false });
+        for (const rel of memoryFiles) {
+            if (!rel.endsWith('.md'))
+                continue;
+            const content = (await fs.readText(`memory/${rel}`)) ?? '';
+            files.push({ path: `memory/${rel}`, summary: summarizeMarkdown(content), tokens: estimateTokens(content) });
+        }
+        const delta = await fs.readText('state/world-delta.jsonl');
+        if (delta !== null) {
+            const count = delta.split('\n').filter((line) => line.trim() !== '').length;
+            files.push({
+                path: 'state/world-delta.jsonl',
+                summary: delta.trim() === '' ? '' : `${count} 条变化`,
+                tokens: estimateTokens(delta),
+            });
+        }
+        const journal = await fs.readText('journal.md');
+        if (journal !== null) {
+            files.push({ path: 'journal.md', summary: summarizeMarkdown(journal), tokens: estimateTokens(journal) });
+        }
+        const index = { files, updatedAt: new Date().toISOString() };
+        await fs.writeText('index.json', JSON.stringify(index, null, 2) + '\n');
+    });
+}

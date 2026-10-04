@@ -1,0 +1,101 @@
+/**
+ * 开场白日志判定：assistant/message 不翻转 dsh 的 blank（只看 turn/start）。
+ * 空白会话一旦被写入开场白，英雄区（含模式选择）会因可见内容消失，
+ * 「新对话」却仍复用该会话，表现为永远卡在 Tavern。
+ */
+
+export interface GreetingLogEvent {
+  type: string
+  data?: unknown
+}
+
+/** ensureGreeting / swipeGreeting 写入的开场白来源标记。 */
+export const TAVERN_GREETING_SOURCE = { provider: 'dsh-tavern', model: 'greeting' } as const
+
+function greetingSource(event: GreetingLogEvent): { provider?: string; model?: string } | undefined {
+  if (event.data === null || typeof event.data !== 'object') return undefined
+  const message = (event.data as { message?: { source?: { provider?: string; model?: string } } }).message
+  return message?.source
+}
+
+export function isTavernGreetingEvent(event: GreetingLogEvent): boolean {
+  if (event.type !== 'assistant/message') return false
+  const source = greetingSource(event)
+  return source?.provider === TAVERN_GREETING_SOURCE.provider && source?.model === TAVERN_GREETING_SOURCE.model
+}
+
+/** 仍算 blank（无 turn/start）但已经有本插件开场白，会被「新对话」复用且藏掉英雄区。 */
+export function isGreetingOnlyBlank(events: readonly GreetingLogEvent[]): boolean {
+  if (events.some((event) => event.type === 'turn/start')) return false
+  return events.some(isTavernGreetingEvent)
+}
+
+export function sessionHasUserMessage(events: readonly GreetingLogEvent[]): boolean {
+  return events.some((event) => event.type === 'user/message')
+}
+
+/**
+ * 开场白变体列表（greetingIndex 的唯一下标口径，服务端、英雄区、chip 与卡面桥必须共用）。
+ * 对齐 ST getFirstMessage：first_mes 为空而有备选开场白时，第一条备选即开场白，空 first_mes 不占位；
+ * 否则空 first_mes 会让会话既没有开场白楼层、也无从 swipe 到备选。
+ */
+export function cardGreetingVariants(firstMes: string, alternateGreetings: readonly string[]): string[] {
+  return !firstMes.trim() && alternateGreetings.length > 0 ? [...alternateGreetings] : [firstMes, ...alternateGreetings]
+}
+
+/**
+ * 绑定下标 → 实际展示的变体下标。编辑角色卡删掉备选开场白后旧会话仍可能带着越界下标：
+ * 一律回退 0（不夹到末尾），正文、翻页计数、卡面 swipe_id 与 MVU 初始化必须共用这一口径。
+ */
+export function activeGreetingIndex(index: number, count: number): number {
+  return Number.isSafeInteger(index) && index >= 0 && index < count ? index : 0
+}
+
+/**
+ * 按绑定下标取开场白。空串 / 纯空白不算有开场白（不偷偷改用别的变体，以免和 swipe 下标错位）。
+ * 下标越界时回退到变体 0。
+ */
+export function pickGreetingText(variants: readonly string[], index: number): string | undefined {
+  const direct = variants[activeGreetingIndex(index, variants.length)]
+  if (typeof direct === 'string' && direct.trim() !== '') return direct
+  return undefined
+}
+
+function greetingMessageId(event: GreetingLogEvent): string | undefined {
+  if (event.data === null || typeof event.data !== 'object') return undefined
+  return (event.data as { message?: { id?: string } }).message?.id
+}
+
+export interface GreetingFloorState {
+  /** 这条 assistant 消息是本插件写入的开场白（会话里第一条 assistant/message）。 */
+  isGreeting: boolean
+  /** 对话已开始（有 user/message）之后不能再 swipe。 */
+  started: boolean
+  swipe: { index: number; total: number } | null
+}
+
+/**
+ * 开场白楼层判定：只有「第一条 assistant 消息且来源是本插件 greeting」才算开场白。
+ * 对话开始后仍识别为开场白（好让 UI 藏掉重新生成/编辑），但 swipe 为 null。
+ */
+export function greetingFloorState(
+  events: readonly GreetingLogEvent[],
+  messageId: string,
+  greetingIndex: number,
+  variantCount: number,
+): GreetingFloorState {
+  const started = sessionHasUserMessage(events)
+  const none: GreetingFloorState = { isGreeting: false, started, swipe: null }
+  if (!messageId) return none
+  const hit = events.find((event) => event.type === 'assistant/message')
+  if (!hit || !isTavernGreetingEvent(hit) || greetingMessageId(hit) !== messageId) return none
+  const total = Math.max(0, variantCount)
+  // 越界一律回退变体 0，与 pickGreetingText 保持一致：
+  // 这里若改成夹到 total - 1，UI 报的位次就和实际渲染的正文对不上，两个 swipe 箭头会都指向当前这条。
+  const index = activeGreetingIndex(greetingIndex, total)
+  return {
+    isGreeting: true,
+    started,
+    swipe: !started && total >= 2 ? { index, total } : null,
+  }
+}

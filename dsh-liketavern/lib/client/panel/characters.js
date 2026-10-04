@@ -1,0 +1,325 @@
+import { jsx as _jsx, jsxs as _jsxs, Fragment as _Fragment } from "react/jsx-runtime";
+/**
+ * 设置面板分区：角色卡（列表 / 导入 / 收纳与恢复 / 永久删除 / 详情 / 交互卡）。
+ * 活跃卡只提供可逆收纳；收纳箱内才提供恢复与永久删除，瞬时反馈走 useToast，上下文错误用 Err。
+ * 交互卡预览保留 CSP meta 注入 + sandbox iframe（无 allow-same-origin），不得放宽。
+ */
+import { cardVariableLabels } from '../cardVariableLabels.js';
+import { useDraftGuard } from '../drafts.js';
+import { buildCardSrcDoc } from '../../core/cardFrame.js';
+import { cardGreetingVariants } from '../../core/greetingLog.js';
+import { CARD_VARIABLE_STYLES } from '../styles.js';
+import { PersistentEditor, useDraftRestored, useDraftState } from '../draftPersistence.js';
+import { useEffect, useRef, useState } from 'react';
+import { Button, IconArchiveOutlineMedium, IconDownloadOutlineMedium, IconRefreshOutlineMedium, IconTrashOutlineMedium, IconUserOutlineMedium, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives';
+import { cachedAvatar, cachedCharacterDetail, invalidateCharacter, notifyCharacterChanged } from '../cache.js';
+import { matchesCharacterSearch } from '../characterSearch.js';
+import { useT } from '../i18n.js';
+import { Avatar, Btn, ConfirmDialog, Dialog, Err, Field, FileBtn, IconBtn, ListInput, Muted, NumInput, SearchEmpty, SearchInput, Section, Select, Skeleton, Tabs, clickableProps, downloadBase64, downloadJson, errOf, fileToBase64, runAsync, useLoader, useToast } from '../util.js';
+/** 按 cardId 拉头像 dataURL 的 Avatar 包装（失败时回落首字符/图标）；头像走进程内缓存。 */
+function CardAvatar(props) {
+    const { state } = useLoader(() => cachedAvatar(props.remote, props.cardId), [props.cardId]);
+    const url = state.status === 'ready' ? state.value.dataUrl : null;
+    return _jsx(Avatar, { url: url, name: props.name, size: props.size });
+}
+/** 海报卡：活跃卡可点进编辑并收纳；收纳箱卡只允许恢复或发起受保护的永久删除。 */
+function CharacterCard(props) {
+    const t = useT();
+    const { state } = useLoader(() => cachedAvatar(props.remote, props.item.cardId), [props.item.cardId]);
+    const url = state.status === 'ready' ? state.value.dataUrl : null;
+    const initial = props.item.name.trim().charAt(0) || '?';
+    const book = props.item.characterBookName
+        ? t('characters.card.embeddedBookNamed', { name: props.item.characterBookName })
+        : t('characters.card.embeddedBook');
+    const meta = props.item.hasCharacterBook
+        ? `${book}${typeof props.item.characterBookEntryCount === 'number' && props.item.characterBookEntryCount > 0
+            ? ` · ${t('characters.card.entryCount', { count: props.item.characterBookEntryCount })}`
+            : ''}`
+        : '';
+    const openProps = props.onOpen ? {
+        ...clickableProps(() => { if (!props.busy)
+            props.onOpen?.(props.item.cardId); }),
+        'aria-disabled': props.busy || undefined,
+    } : {};
+    return (_jsxs("article", { className: `dsh-tavern-charCard${props.archived ? ' is-archived' : ''}`, ...openProps, children: [_jsx("div", { className: "dsh-tavern-charCardCover", children: url ? _jsx("img", { src: url, alt: "" }) : _jsx("span", { className: "dsh-tavern-charCardInitial", children: initial }) }), _jsxs("div", { className: "dsh-tavern-charCardBar", children: [_jsx("div", { className: "dsh-tavern-charCardName", children: props.item.name }), meta ? _jsx("div", { className: "dsh-tavern-charCardMeta", children: meta }) : null] }), _jsx("div", { className: "dsh-tavern-charCardActions", children: props.archived ? (_jsxs(_Fragment, { children: [_jsx(Tooltip, { label: t('characters.card.restore'), side: "bottom", children: _jsx("button", { type: "button", "aria-label": t('characters.card.restore'), className: "dsh-tavern-coverBtn", disabled: props.busy, onClick: (e) => { e.stopPropagation(); props.onRestore(props.item); }, children: _jsx(IconRefreshOutlineMedium, {}) }) }), _jsx(Tooltip, { label: t('characters.card.deletePermanently'), side: "bottom", children: _jsx("button", { type: "button", "aria-label": t('characters.card.deletePermanently'), className: "dsh-tavern-coverBtn is-danger", disabled: props.busy, onClick: (e) => { e.stopPropagation(); props.onDelete(props.item); }, children: _jsx(IconTrashOutlineMedium, {}) }) })] })) : (_jsx(Tooltip, { label: t('characters.card.archive'), side: "bottom", children: _jsx("button", { type: "button", "aria-label": t('characters.card.archive'), className: "dsh-tavern-coverBtn", disabled: props.busy, onClick: (e) => { e.stopPropagation(); props.onArchive(props.item); }, children: _jsx(IconArchiveOutlineMedium, { size: 16 }) }) })) })] }));
+}
+/** 详情弹窗里的「标签 + 多行框」单元，配合 groupHead 分组使用。 */
+function LabeledArea(props) {
+    return (_jsx(Field, { label: props.label, children: _jsx("textarea", { className: "dsh-tavern-input dsh-tavern-textarea", style: { minHeight: props.minHeight ?? 64 }, value: props.value, onChange: (e) => props.onChange(e.target.value) }) }));
+}
+function CharacterDetailDialog(props) {
+    const { remote, cardId } = props;
+    const t = useT();
+    const { state, reload } = useLoader(() => cachedCharacterDetail(remote, cardId), [cardId]);
+    const [cardOpen, setCardOpen] = useState(false);
+    const draftKey = `characters.detail:${cardId}`;
+    const [draft, setDraft] = useDraftState(draftKey, null);
+    const restored = useDraftRestored(draftKey);
+    const preserveRestored = useRef(restored && draft !== null);
+    const [error, setError] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const toast = useToast();
+    const loaded = state.status === 'ready' ? state.value : null;
+    const detail = draft ?? loaded;
+    // 最近一次应用到草稿的服务端值（或保存成功那一刻的草稿）：用于识别 reload 往返窗口期内的新编辑。
+    const appliedRef = useRef(null);
+    // 重读挂起或失败时仍用已知保存版本比较，不能把刚输入的正文误判为已保存。
+    const baseline = loaded ?? appliedRef.current;
+    const dirty = draft !== null && (baseline === null ? restored : JSON.stringify(draft) !== JSON.stringify(baseline));
+    const guard = useDraftGuard(dirty, busy);
+    const draftRef = useRef(draft);
+    draftRef.current = draft;
+    useEffect(() => {
+        if (!loaded)
+            return;
+        // 首次 ready 仅提供比较基线；恢复的未保存正文必须保留。
+        if (preserveRestored.current) {
+            preserveRestored.current = false;
+            appliedRef.current = loaded;
+            return;
+        }
+        // 保存后 reload 落地时，草稿若已偏离基线（往返窗口期内有新键入），不整体覆盖：
+        // 覆盖会静默丢掉窗口期编辑并把 dirty 复位为 false；保留草稿让「未保存」提示继续可见。
+        if (draftRef.current !== null && appliedRef.current !== null && JSON.stringify(draftRef.current) !== JSON.stringify(appliedRef.current))
+            return;
+        appliedRef.current = loaded;
+        setDraft(loaded);
+    }, [loaded, setDraft]);
+    const close = () => guard.request(() => {
+        setDraft(null);
+        props.onClose();
+    });
+    const set = (patch) => setDraft(detail ? { ...detail, ...patch } : detail);
+    const interactiveHtml = typeof detail?.extensions?.interactiveHtml === 'string' ? detail.extensions.interactiveHtml : null;
+    const save = async () => {
+        if (!detail)
+            return;
+        // 旧版恢复草稿没有基线版本，不能拿刚读取的版本替它授权覆盖。
+        if (!detail.revision) {
+            setError(t('characters.detail.missingRevision'));
+            return;
+        }
+        if (!detail.name.trim()) {
+            setError(t('characters.detail.nameRequired'));
+            return;
+        }
+        await runAsync(setBusy, setError, async () => {
+            const r = await remote.saveCharacter({
+                cardId,
+                expectedRevision: detail.revision,
+                name: detail.name,
+                description: detail.description,
+                personality: detail.personality,
+                scenario: detail.scenario,
+                firstMes: detail.firstMes,
+                alternateGreetings: detail.alternateGreetings.map((s) => s.trim()).filter(Boolean),
+                mesExample: detail.mesExample,
+                systemPrompt: detail.systemPrompt,
+                postHistoryInstructions: detail.postHistoryInstructions,
+                creatorNotes: detail.creatorNotes,
+                creator: detail.creator,
+                characterVersion: detail.characterVersion,
+                tags: detail.tags,
+                depthPrompt: detail.depthPrompt ?? null,
+            });
+            const err = errOf(r);
+            if (err) {
+                setError(err);
+                invalidateCharacter(cardId);
+            }
+            else if (r.ok) {
+                // 保存回执推进版本，但只更新版本字段，不能覆盖往返期间的新键入。
+                const revision = r.value.revision;
+                appliedRef.current = { ...detail, revision };
+                setDraft(current => current ? { ...current, revision } : current);
+                toast.show(t('characters.detail.saved', { name: detail.name }));
+                // 先失效详情/头像缓存再 reload，否则详情弹窗与聊天气泡继续吃旧值。
+                notifyCharacterChanged(cardId);
+                reload();
+                props.onSaved();
+            }
+        });
+    };
+    const exportCard = async (kind) => {
+        await runAsync(setBusy, setError, async () => {
+            const r = await remote.exportCharacter({ cardId });
+            if (!r.ok) {
+                setError(r.error.message);
+                return;
+            }
+            if (kind === 'json')
+                downloadJson(`${r.value.name}.json`, r.value.json);
+            else
+                downloadBase64(`${r.value.name}.png`, r.value.pngBase64, 'image/png');
+            toast.show(t('characters.detail.exported', { kind: kind.toUpperCase() }));
+        });
+    };
+    return (_jsxs(Dialog, { open: true, width: "xl", title: t('characters.detail.title', { name: detail?.name ?? cardId }), onClose: close, footer: detail ? _jsxs("div", { className: "dsh-tavern-ui dsh-tavern-footActions", children: [_jsx("span", { className: "dsh-tavern-muted", role: "status", children: dirty ? t('draft.unsaved') : '' }), _jsx("span", { className: "dsh-tavern-footSpacer" }), _jsx(Btn, { size: "md", disabled: busy, onClick: close, children: t('action.close') }), _jsx(Btn, { primary: true, size: "md", disabled: busy || !dirty, onClick: () => void save(), children: t(busy ? 'draft.saving' : 'action.save') })] }) : undefined, children: [toast.node, guard.confirmation, state.status === 'loading' && (_jsxs("div", { style: { display: 'flex', flexDirection: 'column', gap: 8 }, children: [_jsx(Skeleton, { height: 48 }), _jsx(Skeleton, { height: 14, width: "60%" }), _jsx(Skeleton, { height: 90 })] })), state.status === 'error' && _jsxs("div", { children: [_jsx(Err, { message: state.message }), _jsx(Btn, { disabled: busy, onClick: reload, children: t('action.retry') })] }), detail && (_jsxs("fieldset", { disabled: busy, className: "dsh-tavern-editorFields dsh-tavern-dialogStack", style: { fontSize: 13 }, children: [_jsxs("div", { className: "dsh-tavern-panelCard", style: { flexDirection: 'row', alignItems: 'center', gap: 14 }, children: [_jsx(CardAvatar, { remote: remote, cardId: cardId, name: detail.name, size: 52 }), _jsxs("div", { style: { flex: 1, minWidth: 0, display: 'flex', flexDirection: 'column', gap: 8 }, children: [_jsx(Field, { label: t('characters.detail.displayName'), children: _jsx("input", { className: "dsh-tavern-input", style: { width: '100%' }, value: detail.name, onChange: (e) => set({ name: e.target.value }) }) }), _jsxs(Muted, { children: [detail.spec, " \u00B7 v", detail.characterVersion || '?', " \u00B7 ", detail.creator || t('characters.detail.unknownCreator'), detail.hasCharacterBook
+                                                ? ` · ${detail.characterBookName ? t('characters.card.embeddedBookNamed', { name: detail.characterBookName }) : t('characters.card.embeddedBook')}`
+                                                : ''] })] })] }), _jsxs("div", { className: "dsh-tavern-panelCard", children: [_jsx("div", { className: "dsh-tavern-groupHead", children: t('characters.detail.groupPersona') }), _jsx(LabeledArea, { label: t('characters.detail.description'), minHeight: 88, value: detail.description, onChange: (v) => set({ description: v }) }), _jsx(LabeledArea, { label: t('characters.detail.personality'), value: detail.personality, onChange: (v) => set({ personality: v }) }), _jsx(LabeledArea, { label: t('characters.detail.scenario'), value: detail.scenario, onChange: (v) => set({ scenario: v }) })] }), _jsxs("div", { className: "dsh-tavern-panelCard", children: [_jsx("div", { className: "dsh-tavern-groupHead", children: t('characters.detail.groupGreetings') }), _jsx(LabeledArea, { label: t('characters.detail.greeting'), minHeight: 88, value: detail.firstMes, onChange: (v) => set({ firstMes: v }) }), _jsxs("div", { className: "dsh-tavern-field", children: [_jsx("span", { className: "dsh-tavern-fieldLabel", children: t('characters.detail.altGreetings') }), detail.alternateGreetings.map((greeting, index) => _jsxs("div", { className: "dsh-tavern-greetingEntry", children: [_jsxs("label", { className: "dsh-tavern-field", children: [_jsx("span", { className: "dsh-tavern-fieldLabel", children: t('characters.detail.greetingNumber', { index: index + 1 }) }), _jsx("textarea", { className: "dsh-tavern-input dsh-tavern-textarea", value: greeting, disabled: busy, onChange: (e) => set({ alternateGreetings: detail.alternateGreetings.map((text, i) => i === index ? e.target.value : text) }) })] }), _jsx(Btn, { disabled: busy, onClick: () => set({ alternateGreetings: detail.alternateGreetings.filter((_, i) => i !== index) }), children: t('action.delete') })] }, index)), _jsx(Btn, { disabled: busy, onClick: () => set({ alternateGreetings: [...detail.alternateGreetings, ''] }), children: t('characters.detail.addGreeting') })] }), _jsx(LabeledArea, { label: t('characters.detail.mesExample'), value: detail.mesExample, onChange: (v) => set({ mesExample: v }) })] }), _jsxs("div", { className: "dsh-tavern-panelCard", children: [_jsx("div", { className: "dsh-tavern-groupHead", children: t('characters.detail.groupAdvanced') }), _jsx(LabeledArea, { label: t('characters.detail.systemPrompt'), value: detail.systemPrompt, onChange: (v) => set({ systemPrompt: v }) }), _jsx(LabeledArea, { label: t('characters.detail.postHistory'), value: detail.postHistoryInstructions, onChange: (v) => set({ postHistoryInstructions: v }) }), _jsxs(Field, { label: t('characters.detail.depthPrompt'), children: [_jsx("textarea", { className: "dsh-tavern-input dsh-tavern-textarea", style: { minHeight: 64 }, value: detail.depthPrompt?.prompt ?? '', onChange: (e) => set({
+                                            depthPrompt: e.target.value.trim()
+                                                ? { prompt: e.target.value, depth: detail.depthPrompt?.depth ?? 4, role: detail.depthPrompt?.role ?? 'system' }
+                                                : null,
+                                        }) }), detail.depthPrompt ? (_jsxs("div", { className: "dsh-tavern-fieldRow", style: { marginTop: 6 }, children: [_jsx(Field, { label: t('characters.detail.depth'), children: _jsx(NumInput, { value: detail.depthPrompt.depth, onChange: (depth) => set({ depthPrompt: { ...detail.depthPrompt, depth: Math.max(0, Math.round(depth)) } }) }) }), _jsx(Field, { label: t('characters.detail.role'), children: _jsx(Select, { value: detail.depthPrompt.role, onChange: (role) => set({ depthPrompt: { ...detail.depthPrompt, role: role } }), options: [
+                                                        { value: 'system', label: 'system' },
+                                                        { value: 'user', label: 'user' },
+                                                        { value: 'assistant', label: 'assistant' },
+                                                    ] }) })] })) : null] })] }), _jsxs("div", { className: "dsh-tavern-panelCard", children: [_jsx("div", { className: "dsh-tavern-groupHead", children: t('characters.detail.groupMetadata') }), _jsx(LabeledArea, { label: t('characters.detail.creatorNotes'), value: detail.creatorNotes, onChange: (v) => set({ creatorNotes: v }) }), _jsxs("div", { className: "dsh-tavern-fieldRow", children: [_jsx(Field, { label: t('characters.detail.creator'), children: _jsx("input", { className: "dsh-tavern-input", value: detail.creator, onChange: (e) => set({ creator: e.target.value }) }) }), _jsx(Field, { label: t('characters.detail.version'), children: _jsx("input", { className: "dsh-tavern-input", value: detail.characterVersion, onChange: (e) => set({ characterVersion: e.target.value }) }) })] }), _jsx(Field, { label: t('characters.detail.tags'), children: _jsx(ListInput, { style: { width: '100%' }, value: detail.tags, onChange: (tags) => set({ tags }) }) })] }), _jsx(Err, { message: error }), _jsxs("div", { className: "dsh-tavern-footActions", style: { marginTop: 2 }, children: [_jsx(IconBtn, { label: t('characters.detail.exportPng'), disabled: busy, onClick: () => void exportCard('png'), children: _jsx(IconDownloadOutlineMedium, {}) }), interactiveHtml !== null && _jsx(Btn, { size: "md", onClick: () => setCardOpen(true), children: t('interactive.open') }), _jsx("span", { className: "dsh-tavern-footSpacer" }), _jsx(Btn, { size: "md", disabled: busy, onClick: () => void exportCard('json'), children: t('characters.detail.exportJson') })] })] })), cardOpen && interactiveHtml !== null && (_jsx(Dialog, { open: true, width: "lg", title: t('characters.detail.interactiveTitle', { name: detail?.name ?? '' }), onClose: () => setCardOpen(false), children: _jsx("iframe", { sandbox: "allow-scripts", srcDoc: buildCardSrcDoc(interactiveHtml, { greetings: detail ? cardGreetingVariants(detail.firstMes, detail.alternateGreetings) : [], greetingIndex: 0,
+                        helperContext: { name: detail?.name, macroName: detail?.characterName ?? detail?.name, canSwipe: false },
+                        helperLabels: { diagnostics: t('speech.helperMessages'), unsupported: t('speech.helperUnsupported') },
+                        variableStyles: CARD_VARIABLE_STYLES,
+                        variableLabels: cardVariableLabels(t, t('speech.cardDataNote')),
+                    }), title: t('characters.detail.interactiveFrame'), style: { width: '100%', height: '60vh', border: '1px solid var(--dsw-alias-border-l2, rgba(128,128,128,.25))', borderRadius: 16, background: 'var(--dsw-alias-bg-base, #111)' } }) }))] }));
+}
+export function CharactersSection(props) {
+    return _jsx(PersistentEditor, { remote: props.remote, scope: "characters", children: _jsx(CharactersSectionContent, { ...props }) });
+}
+function CharactersSectionContent(props) {
+    const { remote } = props;
+    const t = useT();
+    const [collection, setCollection] = useState('active');
+    const { state, reload } = useLoader(() => collection === 'active' ? remote.listCharacters({}) : remote.listArchivedCharacters({}), [collection]);
+    const [error, setError] = useState(null);
+    const [busy, setBusy] = useState(false);
+    const [detailId, setDetailId] = useDraftState('characters:detailId', null);
+    const [pending, setPending] = useState(null);
+    const [toDelete, setToDelete] = useState(null);
+    const [creating, setCreating] = useDraftState('characters:creating', false);
+    const [newName, setNewName] = useDraftState('characters:newName', '');
+    const [query, setQuery] = useState('');
+    const toast = useToast();
+    const createGuard = useDraftGuard(creating && !!newName.trim(), busy);
+    const closeCreate = () => createGuard.request(() => {
+        setCreating(false);
+        setNewName('');
+    });
+    const doImport = async (name, dataBase64, importWorldBook) => {
+        setBusy(true);
+        setError(null);
+        try {
+            const r = await remote.importCharacter({ name, dataBase64, importWorldBook });
+            const err = errOf(r);
+            if (err)
+                setError(err);
+            else {
+                setPending(null);
+                toast.show(t(importWorldBook ? 'characters.importedWithBook' : 'characters.imported'));
+                reload();
+            }
+        }
+        catch (err2) {
+            setError(err2 instanceof Error ? err2.message : String(err2));
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    const onImportFile = async (file) => {
+        setBusy(true);
+        setError(null);
+        try {
+            const dataBase64 = await fileToBase64(file);
+            const inspected = await remote.inspectCharacter({ name: file.name, dataBase64 });
+            if (!inspected.ok) {
+                setError(inspected.error.message);
+                return;
+            }
+            setPending({ name: file.name, dataBase64, preview: inspected.value });
+        }
+        catch (err2) {
+            setError(err2 instanceof Error ? err2.message : String(err2));
+        }
+        finally {
+            setBusy(false);
+        }
+    };
+    // 写入失败可能只是回执丢失，也可能是另一窗口改了收纳状态；重读列表恢复真实状态，保留错误供重试判断。
+    const refreshAfterError = (message) => {
+        setError(message);
+        reload();
+    };
+    const onDelete = async () => {
+        if (!toDelete)
+            return;
+        const failed = (message) => {
+            // 引用保护和传输失败都关闭确认框，避免正文错误被模态框遮住。
+            setToDelete(null);
+            refreshAfterError(message);
+        };
+        await runAsync(setBusy, setError, async () => {
+            const r = await remote.deleteCharacter({ cardId: toDelete.cardId });
+            const err = errOf(r);
+            if (err)
+                failed(err);
+            else {
+                toast.show(r.ok && r.value.salvagedLorebook
+                    ? t('characters.deletedSalvaged', { name: toDelete.name, book: r.value.salvagedLorebook })
+                    : t('characters.deleted', { name: toDelete.name }));
+                invalidateCharacter(toDelete.cardId);
+                setToDelete(null);
+                reload();
+            }
+        }, failed);
+    };
+    const onArchive = async (item) => {
+        await runAsync(setBusy, setError, async () => {
+            const r = await remote.archiveCharacter({ cardId: item.cardId });
+            const err = errOf(r);
+            if (err)
+                refreshAfterError(err);
+            else {
+                toast.show(t('characters.archived', { name: item.name }));
+                if (detailId === item.cardId)
+                    setDetailId(null);
+                reload();
+            }
+        }, refreshAfterError);
+    };
+    const onRestore = async (item) => {
+        await runAsync(setBusy, setError, async () => {
+            const r = await remote.restoreCharacter({ cardId: item.cardId });
+            const err = errOf(r);
+            if (err)
+                refreshAfterError(err);
+            else {
+                toast.show(t('characters.restored', { name: item.name }));
+                reload();
+            }
+        }, refreshAfterError);
+    };
+    const items = state.status === 'ready' ? state.value.items : [];
+    // 卡多或已有搜索内容时显示搜索框；删卡与刷新不能隐藏仍生效的筛选。
+    const q = query.trim().toLowerCase();
+    const filtered = items.filter((c) => matchesCharacterSearch(c, query));
+    return (_jsxs(Section, { title: t('section.characters'), description: t('characters.section.desc'), children: [toast.node, createGuard.confirmation, _jsx(Tabs, { value: collection, label: t('characters.collectionLabel'), onChange: (value) => {
+                    setCollection(value);
+                    setError(null);
+                    setToDelete(null);
+                }, items: [
+                    { id: 'active', label: t('characters.collection.active') },
+                    { id: 'archived', label: t('characters.collection.archived') },
+                ] }), _jsxs("div", { className: "dsh-tavern-toolbar", children: [collection === 'active' && _jsxs(_Fragment, { children: [_jsx(FileBtn, { accept: ".png,.json", disabled: busy, onFile: (file) => void onImportFile(file), children: t('characters.importFile') }), _jsx(Btn, { size: "md", disabled: busy, onClick: () => setCreating(true), children: t('characters.newCard') })] }), _jsx(Btn, { size: "md", onClick: reload, disabled: busy, children: t('action.refresh') }), (items.length >= 5 || query !== '') && (_jsx(SearchInput, { label: t('characters.searchLabel'), value: query, onChange: setQuery, placeholder: t('characters.searchPlaceholder'), width: 220 }))] }), state.status === 'loading' && (_jsxs("div", { className: "dsh-tavern-charGrid", children: [_jsx(Skeleton, { height: 198, radius: 18 }), _jsx(Skeleton, { height: 198, radius: 18 }), _jsx(Skeleton, { height: 198, radius: 18 })] })), state.status === 'error' && _jsx(Err, { message: state.message }), _jsx(Err, { message: error }), items.length === 0 && state.status === 'ready' && (_jsxs("div", { className: "dsh-tavern-empty", children: [_jsx("div", { className: "dsh-tavern-emptyIcon", children: collection === 'active' ? _jsx(IconUserOutlineMedium, { size: 32 }) : _jsx(IconArchiveOutlineMedium, { size: 32 }) }), _jsx("div", { className: "dsh-tavern-emptyTitle", children: t(collection === 'active' ? 'hero.noCharacters' : 'characters.archive.emptyTitle') }), _jsx("div", { className: "dsh-tavern-emptyDesc", children: t(collection === 'active' ? 'characters.emptyDesc' : 'characters.archive.emptyDesc') })] })), q !== '' && filtered.length === 0 && state.status === 'ready' && (_jsx(SearchEmpty, { what: t('characters.what'), query: query.trim(), onClear: () => setQuery('') })), _jsx("div", { className: "dsh-tavern-charGrid", children: filtered.map((item) => (_jsx(CharacterCard, { remote: remote, item: item, busy: busy, archived: collection === 'archived', onOpen: collection === 'active' ? setDetailId : undefined, onArchive: (card) => void onArchive(card), onRestore: (card) => void onRestore(card), onDelete: setToDelete }, item.cardId))) }), detailId && (_jsx(CharacterDetailDialog, { remote: remote, cardId: detailId, onClose: () => setDetailId(null), onSaved: reload }, detailId)), pending && (_jsxs(Dialog, { open: true, title: t('characters.importPreview.title'), description: !pending.preview.hasCharacterBook
+                    ? t('characters.importPreview.desc', { name: pending.preview.name })
+                    : pending.preview.characterBookName
+                        ? t('characters.importBook.descNamed', { name: pending.preview.name, book: pending.preview.characterBookName, count: pending.preview.entryCount })
+                        : t('characters.importBook.desc', { name: pending.preview.name, count: pending.preview.entryCount }), onClose: () => { if (!busy)
+                    setPending(null); }, footer: _jsxs("div", { className: "dsh-tavern-modalActions", children: [_jsx(Button, { type: "button", variant: "outline", size: "md", disabled: busy, onClick: () => { setPending(null); setError(null); }, children: t('action.cancel') }), pending.preview.hasCharacterBook && _jsx(Button, { type: "button", variant: "outline", size: "md", disabled: busy, onClick: () => void doImport(pending.name, pending.dataBase64, false), children: t('characters.importBook.skip') }), _jsx(Button, { type: "button", variant: "primary", size: "md", disabled: busy, onClick: () => void doImport(pending.name, pending.dataBase64, pending.preview.hasCharacterBook), children: t(pending.preview.hasCharacterBook ? 'characters.importBook.import' : 'characters.importPreview.import') })] }), children: [_jsx(Err, { message: error }), _jsxs("section", { className: "dsh-tavern-compatibility", "aria-label": t('characters.compatibility.title'), children: [_jsx("p", { className: "dsh-tavern-compatibilityNote", children: t('characters.compatibility.note') }), ['unsupported', 'review', 'supported'].map(status => {
+                                const findings = pending.preview.compatibility.findings.filter(item => item.status === status);
+                                return findings.length > 0 && _jsxs("div", { children: [_jsx("h3", { children: t(`characters.compatibility.status.${status}`) }), _jsx("ul", { children: findings.map(item => _jsxs("li", { children: [_jsx("strong", { children: t(`characters.compatibility.${item.code}.title`) }), _jsx("span", { children: t(`characters.compatibility.${item.code}.desc`) }), _jsx("small", { children: t('characters.compatibility.locations', { count: item.count, locations: item.locations.join(', ') }) })] }, item.code)) })] }, status);
+                            })] }), pending.preview.hasCharacterBook && _jsx("p", { className: "dsh-tavern-compatibilityNote", children: t('characters.importBook.skipNote') })] })), _jsx(ConfirmDialog, { open: toDelete !== null, title: t('characters.deletePermanently.title'), description: toDelete ? t('characters.deletePermanently.desc', { name: toDelete.name }) : '', confirmLabel: t('characters.deletePermanently.confirm'), danger: true, busy: busy, onCancel: () => setToDelete(null), onConfirm: () => void onDelete() }), _jsx(Dialog, { open: creating, title: t('characters.create.title'), description: t('characters.create.desc'), onClose: closeCreate, footer: _jsxs("div", { className: "dsh-tavern-modalActions", children: [_jsx(Btn, { size: "md", disabled: busy, onClick: closeCreate, children: t('action.cancel') }), _jsx(Btn, { primary: true, size: "md", disabled: busy || !newName.trim(), onClick: () => {
+                                void runAsync(setBusy, setError, async () => {
+                                    const r = await remote.createCharacter({ name: newName.trim() });
+                                    const err = errOf(r);
+                                    if (err)
+                                        setError(err);
+                                    else {
+                                        toast.show(t('characters.created', { name: r.ok ? r.value.name : newName }));
+                                        setCreating(false);
+                                        setNewName('');
+                                        reload();
+                                        if (r.ok)
+                                            setDetailId(r.value.cardId);
+                                    }
+                                });
+                            }, children: t('characters.create.confirm') })] }), children: _jsx(Field, { label: t('characters.create.namePlaceholder'), children: _jsx("input", { className: "dsh-tavern-input", style: { width: '100%', height: 36, borderRadius: 8, padding: '0 10px', fontSize: 13, boxSizing: 'border-box' }, disabled: busy, value: newName, placeholder: t('characters.create.namePlaceholder'), onChange: (e) => setNewName(e.target.value) }) }) })] }));
+}

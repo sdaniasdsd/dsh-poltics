@@ -1,0 +1,879 @@
+/**
+ * 共享 UI 工具：对齐 dsh 原语（Button / Menu / Modal / Tooltip / Toast）+ 加载 Hook + 文件/下载助手。
+ * 样式集中在 ./styles.js（模块加载即注入）；颜色一律走宿主 --dsw-* 令牌 + Tavern 蓝色 accent。
+ * 原生 select 的 option 弹层用 Menu 实现（避开 Windows 系统白底白字）。
+ */
+import { Children, cloneElement, createContext, isValidElement, useCallback, useContext, useEffect, useId, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { Button, IconChevronDownOutlineMedium, IconSearchOutlineMedium, IconUserOutlineMedium, Menu, Modal, Toast, Tooltip } from '@deepseek-ai/dsh-client-ui-primitives'
+import type { AriaAttributes, CSSProperties, ReactNode } from 'react'
+import type { CardRegexScript } from '../core/types.js'
+import { MAX_WI_KEY_CHARS } from '../core/worldbook.js'
+import { useT } from './i18n.js'
+import type { Envelope } from './types.js'
+import './styles.js'
+
+/** 设置行与字段把可见标签传给实际控件，读屏及语音操作可以按字段名定位。 */
+const ControlLabel = createContext<{ labelId: string; descriptionId?: string } | null>(null)
+function labelNativeControls(children: ReactNode, labelId: string, descriptionId?: string): ReactNode {
+  return Children.map(children, (child) => {
+    if (!isValidElement<AriaAttributes>(child) || typeof child.type !== 'string' || !['input', 'textarea', 'select'].includes(child.type)) return child
+    return cloneElement(child, {
+      'aria-labelledby': child.props['aria-labelledby'] ?? (child.props['aria-label'] ? undefined : labelId),
+      'aria-describedby': child.props['aria-describedby'] ?? descriptionId,
+    })
+  })
+}
+
+export function Btn(props: {
+  onClick: () => void
+  disabled?: boolean
+  danger?: boolean
+  primary?: boolean
+  pressed?: boolean
+  title?: string
+  size?: 'sm' | 'md'
+  children?: ReactNode
+}) {
+  return (
+    <Button
+      type="button"
+      className="dsh-tavern-btn"
+      variant={props.primary ? 'primary' : 'outline'}
+      size={props.size ?? 'sm'}
+      disabled={props.disabled}
+      title={props.title}
+      aria-pressed={props.pressed}
+      onClick={(e: { stopPropagation: () => void }) => {
+        e.stopPropagation()
+        props.onClick()
+      }}
+      style={props.danger ? { color: 'var(--dsw-alias-state-error-primary, #ec1313)' } : undefined}
+    >
+      {props.children}
+    </Button>
+  )
+}
+
+/** 为所有值加同一前缀，空值不会与用户资产名碰撞。 */
+const selectOptionId = (value: string) => `value:${value}`
+
+export interface SelectOption {
+  value: string
+  label: string
+}
+
+/** 用 dsh Menu 实现的下拉（避开 Windows 原生 option 白底白字）；anchor 是通用设置的 36px 胶囊选择器。 */
+export function Select(props: {
+  value: string
+  onChange: (value: string) => void
+  options: SelectOption[]
+  disabled?: boolean
+  title?: string
+  width?: number | string
+  size?: 'sm' | 'md'
+}) {
+  const [open, setOpen] = useState(false)
+  const label = useContext(ControlLabel)
+  const selected = props.options.find((o) => o.value === props.value)
+  const width = props.width ?? '100%'
+  // 保存等操作会临时禁用整张表单；若此时菜单正展开，只把传给 Menu 的 open
+  // 变成 false 会留下内部 open=true，操作结束后菜单会无故再次弹出。
+  useEffect(() => {
+    if (props.disabled) setOpen(false)
+  }, [props.disabled])
+  return (
+    <div className="dsh-tavern-select" style={{ width }}>
+      <Menu
+        open={open && !props.disabled}
+        portal
+        compact={props.size !== 'md'}
+        align="start"
+        selectedId={selectOptionId(props.value)}
+        onClose={() => setOpen(false)}
+        onSelect={(id: string) => {
+          const option = props.options.find((item) => selectOptionId(item.value) === id)
+          if (!props.disabled && option) props.onChange(option.value)
+          setOpen(false)
+        }}
+        anchor={
+          <button
+            type="button"
+            className={`dsh-tavern-pillSelect${props.size === 'sm' ? ' is-sm' : ''}`}
+            aria-haspopup="menu"
+            aria-expanded={open && !props.disabled}
+            aria-label={props.title}
+            aria-labelledby={props.title ? undefined : label?.labelId}
+            aria-describedby={label?.descriptionId}
+            disabled={props.disabled}
+            title={props.title}
+            onClick={() => setOpen((v: boolean) => !v)}
+          >
+            <span className="dsh-tavern-pillSelectLabel">{selected?.label ?? props.value}</span>
+            <IconChevronDownOutlineMedium className="dsh-tavern-pillSelectChevron" />
+          </button>
+        }
+        items={props.options.map((o) => ({
+          id: selectOptionId(o.value),
+          label: o.label,
+        }))}
+      />
+    </div>
+  )
+}
+
+export function FileBtn(props: {
+  accept: string
+  disabled?: boolean
+  onFile: (file: File) => void
+  children?: ReactNode
+}) {
+  return (
+    <Button
+      type="button"
+      variant="outline"
+      size="md"
+      disabled={props.disabled}
+      className="dsh-tavern-file dsh-tavern-btn"
+      onClick={() => {
+        const el = document.createElement('input')
+        el.type = 'file'
+        el.accept = props.accept
+        el.onchange = () => {
+          const file = el.files?.[0]
+          if (file) props.onFile(file)
+        }
+        el.click()
+      }}
+    >
+      {props.children}
+    </Button>
+  )
+}
+
+export function Section(props: { title?: string; description?: string; children?: ReactNode }) {
+  return (
+    <section className="dsh-tavern-section">
+      {props.title || props.description ? (
+        <header className="dsh-tavern-pageHead">
+          {props.title ? <h3 className="dsh-tavern-pageTitle">{props.title}</h3> : null}
+          {props.description ? <p className="dsh-tavern-pageIntro">{props.description}</p> : null}
+        </header>
+      ) : null}
+      {props.children}
+    </section>
+  )
+}
+
+export interface TabItem {
+  id: string
+  label: string
+}
+
+/** 分段控件式页签（pill track，区别于宿主通用设置的下划线页签）；size="sm" 用于弹窗内等紧凑场景。 */
+export function Tabs(props: { items: TabItem[]; value: string; onChange: (id: string) => void; size?: 'md' | 'sm'; id?: string; panelId?: string; label?: string }) {
+  const generatedId = useId()
+  const id = props.id ?? generatedId
+  const nav = useRef<HTMLDivElement>(null)
+  // 调用方普遍传内联数组字面量（每次渲染新引用）：按 id 和文案派生稳定信号（语言切换后仍需重新定位），
+  // 否则每次键入重渲染都销毁重建 ResizeObserver 并触发强制布局读。
+  const itemsKey = JSON.stringify(props.items.map((item) => [item.id, item.label]))
+  // 缩窄窗口或恢复上次页签后，当前项不能藏到横向滚动区域外；只移动导航，不改变正文纵向滚动位置。
+  useLayoutEffect(() => {
+    const element = nav.current
+    if (!element) return
+    const reveal = () => {
+      const selected = element.querySelector<HTMLElement>('[aria-selected="true"]')
+      if (!selected || element.scrollWidth <= element.clientWidth) return
+      const bounds = element.getBoundingClientRect(), item = selected.getBoundingClientRect()
+      if (item.left < bounds.left + 4) element.scrollLeft += item.left - bounds.left - 4
+      else if (item.right > bounds.right - 4) element.scrollLeft += item.right - bounds.right + 4
+    }
+    reveal()
+    if (typeof ResizeObserver === 'undefined') return
+    const observer = new ResizeObserver(reveal)
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [props.value, itemsKey])
+  return (
+    <div ref={nav} className={`dsh-tavern-navPills${props.size === 'sm' ? ' is-sub' : ''}`} role="tablist" aria-label={props.label} onKeyDown={(e) => {
+      const direction = e.key === 'ArrowRight' ? 1 : e.key === 'ArrowLeft' ? -1 : 0
+      if (!direction && e.key !== 'Home' && e.key !== 'End') return
+      const buttons = Array.from(e.currentTarget.querySelectorAll<HTMLButtonElement>('[role="tab"]'))
+      const current = buttons.indexOf(e.target as HTMLButtonElement)
+      if (current < 0) return
+      e.preventDefault()
+      const next = e.key === 'Home' ? 0 : e.key === 'End' ? buttons.length - 1 : (current + direction + buttons.length) % buttons.length
+      buttons[next]?.focus()
+    }}>
+      {props.items.map((item) => (
+        <button
+          key={item.id}
+          type="button"
+          role="tab"
+          id={`${id}-${item.id}`}
+          tabIndex={props.value === item.id ? 0 : -1}
+          className="dsh-tavern-navPill"
+          data-active={props.value === item.id ? 'true' : 'false'}
+          aria-selected={props.value === item.id}
+          aria-controls={props.panelId}
+          onClick={() => props.onChange(item.id)}
+        >
+          {item.label}
+        </button>
+      ))}
+    </div>
+  )
+}
+
+/** 分组保存行：与上方表单一条淡分隔，主操作左齐。 */
+export function SaveBar(props: { children?: ReactNode; inline?: boolean }) {
+  return <div className={`dsh-tavern-saveBar${props.inline ? ' is-inline' : ''}`}>{props.children}</div>
+}
+
+export function Badge(props: { accent?: boolean; danger?: boolean; children?: ReactNode }) {
+  const cls = props.accent ? ' is-accent' : props.danger ? ' is-danger' : ''
+  return <span className={`dsh-tavern-badge${cls}`}>{props.children}</span>
+}
+
+/**
+ * 预设/卡内嵌 regex_scripts 的展示行：开关 + 名称 + 作用域徽标 + 查找式。
+ * 作用域语义与 core/regex.ts 的 compileRegexScripts 一致；onToggle 传入时显示启用开关。
+ */
+export function RegexScriptRow(props: { script: CardRegexScript; index: number; onToggle?: (disabled: boolean) => void; disabled?: boolean }) {
+  const { script } = props
+  const t = useT()
+  const badges: string[] = []
+  if (script.markdownOnly && script.promptOnly) badges.push(t('util.regexScope.displayAndPrompt'))
+  else if (script.markdownOnly) badges.push(t('util.regexScope.displayOnly'))
+  else if (script.promptOnly) badges.push(t('util.regexScope.promptOnly'))
+  else {
+    for (const p of script.placement ?? [2]) {
+      if (p === 1) badges.push(t('util.regexScope.userInput'))
+      else if (p === 2) badges.push(t('util.regexScope.aiOutput'))
+      else if (p === 5) badges.push(t('util.regexScope.worldInfo'))
+    }
+  }
+  const find = script.findRegex ?? ''
+  const enabled = script.disabled !== true
+  return (
+    <div className="dsh-tavern-memo">
+      <div className="dsh-tavern-memoHead">
+        {props.onToggle ? (
+          <Toggle checked={enabled} disabled={props.disabled} onChange={(on) => props.onToggle!(!on)} title={enabled ? t('util.regex.disable') : t('util.regex.enable')} />
+        ) : null}
+        <span className="dsh-tavern-memoMeta" style={{ color: 'var(--dsw-alias-label-primary, inherit)', fontWeight: 500 }}>
+          {script.scriptName?.trim() || t('util.regex.unnamed', { index: props.index + 1 })}
+        </span>
+        {badges.map((label) => (
+          <Badge key={label}>{label}</Badge>
+        ))}
+      </div>
+      <div
+        className="dsh-tavern-codeFont"
+        title={find}
+        style={{ fontSize: 12, color: 'var(--dsw-alias-label-tertiary, inherit)', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+      >
+        {find || t('util.regex.noFind')}
+      </div>
+    </div>
+  )
+}
+
+/** 条目启用开关（对齐 SillyTavern 的 on/off，视觉走 dsh 胶囊）。 */
+export function Toggle(props: {
+  checked: boolean
+  onChange: (value: boolean) => void
+  disabled?: boolean
+  title?: string
+}) {
+  const label = useContext(ControlLabel)
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={props.checked}
+      aria-label={props.title}
+      aria-labelledby={props.title ? undefined : label?.labelId}
+      aria-describedby={label?.descriptionId}
+      className={`dsh-tavern-toggle${props.checked ? ' is-on' : ''}`}
+      disabled={props.disabled}
+      title={props.title}
+      onClick={(e) => {
+        e.stopPropagation()
+        props.onChange(!props.checked)
+      }}
+    />
+  )
+}
+
+export function IconBtn(props: {
+  label: string
+  danger?: boolean
+  disabled?: boolean
+  onClick: () => void
+  children?: ReactNode
+}) {
+  return (
+    <Tooltip label={props.label} side="bottom">
+      <button
+        type="button"
+        aria-label={props.label}
+        className={`dsh-tavern-iconBtn${props.danger ? ' is-danger' : ''}`}
+        disabled={props.disabled}
+        onClick={(e) => {
+          e.stopPropagation()
+          props.onClick()
+        }}
+      >
+        {props.children}
+      </button>
+    </Tooltip>
+  )
+}
+
+/** 对齐通用设置：标题 + 说明 + 右侧控件。stacked = 宽控件（checkbox 列表等）换成纵向满宽。inline 已废弃（现在默认就是行式）。 */
+export function SettingsRow(props: { title: string; description?: string; stacked?: boolean; inline?: boolean; children?: ReactNode }) {
+  const id = useId(), labelId = `${id}-label`, descriptionId = props.description ? `${id}-description` : undefined
+  return (
+    <div className={`dsh-tavern-row${props.stacked ? ' is-stacked' : ''}`}>
+      <div className="dsh-tavern-rowText">
+        <div id={labelId} className="dsh-tavern-rowTitle">{props.title}</div>
+        {props.description ? <div id={descriptionId} className="dsh-tavern-rowDesc">{props.description}</div> : null}
+      </div>
+      <div className="dsh-tavern-rowControl"><ControlLabel.Provider value={{ labelId, descriptionId }}>
+        {labelNativeControls(props.children, labelId, descriptionId)}
+      </ControlLabel.Provider></div>
+    </div>
+  )
+}
+
+export function Field(props: { label: string; children?: ReactNode }) {
+  const labelId = useId()
+  return (
+    <div className="dsh-tavern-field">
+      <span id={labelId} className="dsh-tavern-fieldLabel">{props.label}</span>
+      <ControlLabel.Provider value={{ labelId }}>{labelNativeControls(props.children, labelId)}</ControlLabel.Provider>
+    </div>
+  )
+}
+
+/** 列表搜索框（36px 胶囊 + 前导图标），配合面板里的关键字过滤。 */
+export function SearchInput(props: {
+  label: string
+  value: string
+  onChange: (value: string) => void
+  placeholder?: string
+  width?: number | string
+}) {
+  const t = useT()
+  return (
+    <div className="dsh-tavern-search" role="search" style={{ width: props.width ?? 220 }}>
+      <span className="dsh-tavern-searchIcon">
+        <IconSearchOutlineMedium />
+      </span>
+      <input
+        type="text"
+        aria-label={props.label}
+        placeholder={props.placeholder ?? t('common.searchPlaceholder')}
+        value={props.value}
+        onChange={(e) => props.onChange(e.target.value)}
+      />
+    </div>
+  )
+}
+
+/** 列表搜索的空结果态：与各面板空态同一套样式，附「清空搜索」动作。 */
+export function SearchEmpty(props: { what: string; query: string; onClear: () => void }) {
+  const t = useT()
+  return (
+    <div className="dsh-tavern-empty">
+      <div className="dsh-tavern-emptyTitle">{t('common.noMatch', { what: props.what })}</div>
+      <div className="dsh-tavern-emptyDesc">
+        {t('common.noMatchDesc', { query: props.query })}
+        <button type="button" className="dsh-tavern-linkBtn" onClick={props.onClear}>
+          {t('action.clearSearch')}
+        </button>
+      </div>
+    </div>
+  )
+}
+
+/** 多选 chip 组（替代复选框列表）：点击把选项切进/切出 selected，选中带对勾前缀。 */
+export function CheckChips(props: {
+  options: { value: string; label: string }[]
+  selected: readonly string[]
+  onChange: (next: string[]) => void
+  ariaLabel?: string
+}) {
+  return (
+    <div className="dsh-tavern-filters" role="group" aria-label={props.ariaLabel}>
+      {props.options.map((o) => {
+        const on = props.selected.includes(o.value)
+        return (
+          <button
+            key={o.value}
+            type="button"
+            className="dsh-tavern-chip is-check"
+            data-active={on ? 'true' : 'false'}
+            aria-pressed={on}
+            onClick={() => props.onChange(on ? props.selected.filter((v) => v !== o.value) : [...props.selected, o.value])}
+          >
+            {o.label}
+          </button>
+        )
+      })}
+    </div>
+  )
+}
+
+export function Err(props: { message: string | null }) {
+  if (!props.message) return null
+  return <div className="dsh-tavern-errText" role="alert">{props.message}</div>
+}
+
+export function Muted(props: { children?: ReactNode }) {
+  return <span className="dsh-tavern-muted">{props.children}</span>
+}
+
+/** 头像：有图出图，无图出首字符（小尺寸回退为用户图标），不再是灰块。尺寸经 --tavern-avatar-s 传入。 */
+export function Avatar(props: { url?: string | null; name?: string; size?: number; className?: string }) {
+  const size = props.size ?? 40
+  const style = { '--tavern-avatar-s': `${size}px` } as CSSProperties
+  const cls = `dsh-tavern-avatar${props.className ? ` ${props.className}` : ''}`
+  if (props.url) {
+    return (
+      <span className={cls} style={style} aria-hidden="true">
+        <img src={props.url} alt="" />
+      </span>
+    )
+  }
+  const initial = (props.name ?? '').trim().charAt(0)
+  if (initial && size >= 24) {
+    return (
+      <span className={cls} style={style} aria-hidden="true">
+        {initial}
+      </span>
+    )
+  }
+  return (
+    <span className={cls} style={style} aria-hidden="true">
+      <IconUserOutlineMedium size={Math.max(12, Math.round(size * 0.6))} />
+    </span>
+  )
+}
+
+/** shimmer 骨架条/块，替换「加载中…」。 */
+export function Skeleton(props: { width?: number | string; height?: number; radius?: number; style?: CSSProperties }) {
+  return (
+    <div
+      className="dsh-tavern-skeleton"
+      aria-hidden="true"
+      style={{ width: props.width ?? '100%', height: props.height ?? 14, borderRadius: props.radius, ...props.style }}
+    />
+  )
+}
+
+/** 顶部横幅通知（宿主 Toast：滑入→停留→淡出后 onDone）。瞬时操作反馈用它，上下文错误仍用 Err。 */
+export function useToast() {
+  // key 用单调计数器而不是 Date.now()：同毫秒两次 show 会撞 key，React 复用实例只换文本，
+  // 第二条消息沿用第一条的停留计时器提前淡出。计数器保证每次 show 都重建实例。
+  const counter = useRef(0)
+  const [item, setItem] = useState<{ key: number; text: string } | null>(null)
+  const show = useCallback((text: string) => { counter.current += 1; setItem({ key: counter.current, text }) }, [])
+  const node = item ? <Toast key={item.key} text={item.text} onDone={() => setItem(null)} /> : null
+  return { show, node }
+}
+
+/** 让卡片等元素可键盘触发（Enter/Space），配合 .is-clickable。 */
+export function clickableProps(onClick: () => void) {
+  return {
+    role: 'button',
+    tabIndex: 0,
+    onClick,
+    onKeyDown: (e: { key: string; target: unknown; currentTarget: unknown; preventDefault: () => void }) => {
+      if (e.target !== e.currentTarget) return
+      if (e.key === 'Enter' || e.key === ' ') {
+        e.preventDefault()
+        onClick()
+      }
+    },
+  }
+}
+
+type LoadState<T> = { status: 'idle' } | { status: 'loading' } | { status: 'ready'; value: T } | { status: 'error'; message: string }
+
+/** 拉取一个 remote 读取；reload() 触发重拉；enabled=false 时挂起（idle）。 */
+export function useLoader<T>(load: () => Promise<Envelope<T>>, deps: readonly unknown[] = [], enabled = true, timeoutMs = 20_000) {
+  const t = useT()
+  const [seq, setSeq] = useState(0)
+  const request = useMemo(() => ({}), [...deps, seq, enabled])
+  const [result, setResult] = useState<{ request: object; state: LoadState<T> }>(() => ({
+    request, state: enabled ? { status: 'loading' } : { status: 'idle' },
+  }))
+  // effect 在提交后才清理旧请求；依赖变化的首帧就必须隐藏旧结果，避免消费方把旧角色/剧情
+  // 存成新身份的基线。相同依赖的普通重渲染仍保留结果，reload 期间由消费方决定是否保留旧显示。
+  const state: LoadState<T> = result.request === request ? result.state : enabled ? { status: 'loading' } : { status: 'idle' }
+  useEffect(() => {
+    const setState = (state: LoadState<T>) => setResult({ request, state })
+    if (!enabled) {
+      setState({ status: 'idle' })
+      return
+    }
+    let alive = true
+    setState({ status: 'loading' })
+    // remote 挂起（通道中断/服务无响应）时不能永远停在骨架屏：超时转错误态，面板上有「刷新」可重试；
+    // alive 不提前置 false，迟到的好结果仍会覆盖错误态、自动恢复。
+    const timer = setTimeout(() => {
+      if (alive) setState({ status: 'error', message: t('util.loadTimeout') })
+    }, timeoutMs)
+    const settle = () => clearTimeout(timer)
+    // typert 通常返回 Promise，但代理未安装、方法 getter 或测试替身也可能在返回
+    // Promise 前同步抛错。先进入已解决 Promise，把两类失败统一收进错误态；否则
+    // 异常会逃出 effect，页面既白屏又无法点 reload 恢复。
+    Promise.resolve()
+      .then(load)
+      .then((r) => {
+        settle()
+        if (alive) setState(r.ok ? { status: 'ready', value: r.value } : { status: 'error', message: r.error.message })
+      })
+      .catch((e) => {
+        settle()
+        if (alive) setState({ status: 'error', message: e instanceof Error ? e.message : String(e) })
+      })
+    return () => {
+      alive = false
+      clearTimeout(timer)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [request])
+  // reload 身份稳定：调用方把它放进 effect 依赖（如绑定变更监听）时不会每次渲染都重新订阅。
+  const reload = useCallback(() => setSeq((s) => s + 1), [])
+  return { state, reload }
+}
+
+/** 信封 → 错误消息（ok 时返回 null）。 */
+export function errOf(r: Envelope<unknown>): string | null {
+  return r.ok ? null : r.error.message
+}
+
+/**
+ * 面板写操作的统一外壳：置 busy → 清旧错 → 跑 fn，成功失败都在 finally 解锁。
+ * typert 在传输失败和入参 zod 严格校验不过时是 reject，不是错误信封，
+ * 而按钮上的 `onClick={() => void save()}` 会把这个 reject 吞掉；
+ * 传输层 reject 也必须解锁按钮，否则 busy 永远为 true、保存按钮再也点不动，草稿全丢。
+ * onError 传入时，reject 的消息改走 onError（如 toast 瞬时提示），不再写 setError；
+ * fn 内自行 setError 的错误信封不受影响（上下文错误仍走 Err）。
+ */
+export async function runAsync(
+  setBusy: (busy: boolean) => void,
+  setError: (message: string | null) => void,
+  fn: () => Promise<void>,
+  onError?: (message: string) => void,
+): Promise<void> {
+  setBusy(true)
+  setError(null)
+  try {
+    await fn()
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e)
+    if (onError) onError(message)
+    else setError(message)
+  } finally {
+    setBusy(false)
+  }
+}
+
+export function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => {
+      const url = String(reader.result)
+      resolve(url.slice(url.indexOf(',') + 1))
+    }
+    reader.onerror = () => reject(reader.error)
+    reader.readAsDataURL(file)
+  })
+}
+
+export async function readJsonFile(file: File): Promise<unknown> {
+  return JSON.parse(await file.text()) as unknown
+}
+
+export function downloadJson(filename: string, json: unknown, space = 2): void {
+  const blob = new Blob([JSON.stringify(json, null, space)], { type: 'application/json' })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+export function downloadBase64(filename: string, base64: string, mime: string): void {
+  const binary = atob(base64)
+  const bytes = new Uint8Array(binary.length)
+  for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i)
+  const blob = new Blob([bytes], { type: mime })
+  const url = URL.createObjectURL(blob)
+  const a = document.createElement('a')
+  a.href = url
+  a.download = filename
+  a.click()
+  setTimeout(() => URL.revokeObjectURL(url), 1000)
+}
+
+/** primitives Modal 的薄封装（统一关闭文案）；width 档：sm 380（默认）/ md 480 / lg 680 / xl 880 / full 1280（近全屏）。 */
+export function Dialog(props: {
+  open: boolean
+  title: string
+  description?: string
+  onClose: () => void
+  footer?: ReactNode
+  width?: 'sm' | 'md' | 'lg' | 'xl' | 'full'
+  children?: ReactNode
+}) {
+  const t = useT()
+  // Modal 的 dialog 本体不限高，超高内容会把整个弹窗顶出视口。
+  // 滚动区放在 content 层（Modal 注释里指定的 scrollable content region）并钉死
+  // max-height，保证任何视口高度下弹窗底部都不被裁。
+  // 宽度档必须落在 dialog 外壳（className）：外壳自带 width:min(380px,100%)，
+  // 宽度类挂在内容层会被外壳卡住，怎么调都只有默认宽度。
+  const widthClass =
+    props.width === 'md'
+      ? 'dsh-tavern-modal-md'
+      : props.width === 'lg'
+        ? 'dsh-tavern-modal-lg'
+        : props.width === 'xl'
+          ? 'dsh-tavern-modal-xl'
+          : props.width === 'full'
+            ? 'dsh-tavern-modal-full'
+            : ''
+  return (
+    <Modal
+      open={props.open}
+      onClose={props.onClose}
+      title={props.title}
+      description={props.description}
+      closeLabel={t('action.close')}
+      footer={props.footer}
+      className={widthClass || undefined}
+      contentClassName={`dsh-tavern-modalContent${props.footer ? ' dsh-tavern-modalHasFooter' : ''}`}
+    >
+      <div className="dsh-tavern-ui dsh-tavern-modalBody">{props.children}</div>
+    </Modal>
+  )
+}
+
+export function ConfirmDialog(props: {
+  open: boolean
+  title: string
+  description: string
+  confirmLabel?: string
+  danger?: boolean
+  busy?: boolean
+  onCancel: () => void
+  onConfirm: () => void
+}) {
+  const t = useT()
+  // 请求已经提交后，Esc/遮罩和按钮必须遵守同一 busy 闸门；仅禁用 footer
+  // 按钮仍会让 Modal.onClose 绕过限制，导致进行中的破坏性操作失去可见反馈。
+  const cancel = () => {
+    if (!props.busy) props.onCancel()
+  }
+  const confirm = () => {
+    if (!props.busy) props.onConfirm()
+  }
+  return (
+    <Modal
+      open={props.open}
+      onClose={cancel}
+      title={props.title}
+      description={props.description}
+      closeLabel={t('action.cancel')}
+      footer={
+        <div className="dsh-tavern-modalActions">
+          <Button type="button" variant="outline" size="md" disabled={props.busy} onClick={cancel}>
+            {t('action.cancel')}
+          </Button>
+          <Button
+            type="button"
+            variant="primary"
+            size="md"
+            disabled={props.busy}
+            onClick={confirm}
+            style={props.danger ? { background: 'var(--dsw-alias-state-error-primary, #ec1313)', borderColor: 'transparent' } : undefined}
+          >
+            {props.confirmLabel ?? t('action.confirm')}
+          </Button>
+        </div>
+      }
+    />
+  )
+}
+
+/** 数字输入保留未完成文本；空值不误提交为 0，失焦时显示有效值，外部重置及时同步。 */
+export function NumInput(props: { value: number; onChange: (v: number) => void; step?: string; width?: number }) {
+  const label = useContext(ControlLabel)
+  const value = Number.isFinite(props.value) ? props.value : 0
+  const [draft, setDraft] = useState(() => ({ value, text: String(value), pending: false }))
+  let text = draft.text
+  if (draft.pending) {
+    // 本次键入可触发父表单限幅：保留输入文本才能逐位输入 25（第一位 2 可能被夹成 10）。
+    // 记录本次回传后的业务值，之后独立发生的外部重置仍会立即覆盖文本。
+    setDraft({ value, text, pending: false })
+  } else if (!Object.is(draft.value, value)) {
+    text = String(value)
+    setDraft({ value, text, pending: false })
+  }
+  return (
+    <input
+      type="number"
+      aria-labelledby={label?.labelId}
+      aria-describedby={label?.descriptionId}
+      className="dsh-tavern-input"
+      style={{ width: props.width ?? 90 }}
+      value={text}
+      step={props.step ?? 'any'}
+      onChange={(e) => {
+        const raw = e.target.value
+        const next = raw.trim() === '' ? NaN : Number(raw)
+        if (!Number.isFinite(next)) {
+          setDraft({ value, text: raw, pending: true })
+          return
+        }
+        setDraft({ value, text: raw, pending: true })
+        props.onChange(next)
+      }}
+      onBlur={() => setDraft({ value, text: String(value), pending: false })}
+    />
+  )
+}
+
+/** 可空数字输入（null ↔ 空串）。 */
+export function NullableNumInput(props: { value: number | null; onChange: (v: number | null) => void; width?: number }) {
+  const t = useT()
+  const label = useContext(ControlLabel)
+  return (
+    <input
+      type="number"
+      aria-labelledby={label?.labelId}
+      aria-describedby={label?.descriptionId}
+      className="dsh-tavern-input"
+      style={{ width: props.width ?? 90 }}
+      value={props.value ?? ''}
+      placeholder={t('common.unlimited')}
+      onChange={(e) => {
+        const raw = e.target.value
+        if (raw === '') return props.onChange(null)
+        const v = Number(raw)
+        if (Number.isFinite(v)) props.onChange(v)
+      }}
+    />
+  )
+}
+
+/** 以逗号或换行分隔的字符串列表。全角逗号与半角逗号等价，空项忽略。 */
+export function splitListText(text: string): string[] {
+  return text.split(/[,，\n]/).map((item) => item.trim()).filter(Boolean)
+}
+
+/** 世界书关键词中的正则字面量只做有界词法扫描；量词/字符类内的逗号不分项，绝不编译或执行。 */
+export function splitRegexListText(text: string): string[] {
+  const separator = (char: string | undefined) => char === ',' || char === '，' || char === '\n'
+  const regexEnd = (start: number): number => {
+    let escaped = false, inClass = false
+    const limit = Math.min(text.length, start + MAX_WI_KEY_CHARS)
+    for (let index = start + 1; index < limit; index++) {
+      const char = text[index]!
+      if (char === '\n' || char === '\r') return -1
+      if (escaped) { escaped = false; continue }
+      if (char === '\\') { escaped = true; continue }
+      if (char === '[') inClass = true
+      else if (char === ']') inClass = false
+      else if (char === '/' && !inClass) {
+        let end = index + 1
+        while (end < limit && text[end]! >= 'a' && text[end]! <= 'z') end++
+        let next = end
+        while (next < text.length && !separator(text[next]) && text[next]!.trim() === '') next++
+        if (next === text.length || separator(text[next])) return end
+      }
+    }
+    return -1
+  }
+  const items: string[] = []
+  let start = 0, atStart = true
+  for (let index = 0; index < text.length; index++) {
+    const char = text[index]!
+    if (separator(char)) {
+      const item = text.slice(start, index).trim()
+      if (item) items.push(item)
+      start = index + 1; atStart = true
+    } else if (atStart && char.trim() !== '') {
+      atStart = false
+      if (char === '/') {
+        const end = regexEnd(index)
+        if (end >= 0) index = end - 1
+      }
+    }
+  }
+  const last = text.slice(start).trim()
+  if (last) items.push(last)
+  return items
+}
+
+export function joinListText(items: readonly string[]): string {
+  return items.join(', ')
+}
+
+/**
+ * 关键词/标签这类列表输入：输入框持有原始文本，解析结果提交给业务状态。
+ * 若把业务数组重新拼接成受控值，用户键入的分隔符和尾随空格会被立即吞掉，无法输入第二项。
+ * 只有业务值与当前文本的解析结果不一致（切换条目、放弃修改、恢复草稿）时才采用外部值。
+ */
+export function ListInput(props: { value: readonly string[]; onChange: (items: string[]) => void; className?: string; style?: CSSProperties; placeholder?: string; preserveRegex?: boolean }) {
+  const label = useContext(ControlLabel)
+  const [text, setText] = useState(() => joinListText(props.value))
+  const split = props.preserveRegex ? splitRegexListText : splitListText
+  const external = joinListText(props.value)
+  const shown = joinListText(split(text)) === external ? text : external
+  return (
+    <input
+      aria-labelledby={label?.labelId}
+      aria-describedby={label?.descriptionId}
+      className={props.className ?? 'dsh-tavern-input'}
+      style={props.style}
+      value={shown}
+      placeholder={props.placeholder}
+      onChange={(e) => {
+        setText(e.target.value)
+        props.onChange(split(e.target.value))
+      }}
+    />
+  )
+}
+
+/** 每行一项（停止序列、主机白名单）；空行与首尾空白不入值。 */
+export function splitLineListText(text: string): string[] {
+  return text.split('\n').map((item) => item.trim()).filter(Boolean)
+}
+
+/** ListInput 的多行版本：同样由文本框持有原文，回车与行尾空格不会被受控回显吞掉。 */
+export function LineListInput(props: { value: readonly string[]; onChange: (items: string[]) => void; style?: CSSProperties }) {
+  const label = useContext(ControlLabel)
+  const [text, setText] = useState(() => props.value.join('\n'))
+  const external = props.value.join('\n')
+  const shown = splitLineListText(text).join('\n') === external ? text : external
+  return (
+    <textarea
+      aria-labelledby={label?.labelId}
+      aria-describedby={label?.descriptionId}
+      className="dsh-tavern-input dsh-tavern-textarea dsh-tavern-codeFont"
+      style={props.style}
+      value={shown}
+      onChange={(e) => {
+        setText(e.target.value)
+        props.onChange(splitLineListText(e.target.value))
+      }}
+    />
+  )
+}

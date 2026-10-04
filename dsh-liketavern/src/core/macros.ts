@@ -1,0 +1,329 @@
+/**
+ * 宏展开器（纯函数，除 MacroContext.store 为一次组装内的可变变量表）。
+ *
+ * 支持清单：
+ * - `{{char}}` / `{{charname}}`：角色名
+ * - `{{user}}` / `{{username}}`：用户人设名
+ * - `{{description}}` / `{{personality}}` / `{{scenario}}`：角色卡字段
+ * - `{{persona}}`：当前用户人设描述
+ * - `{{charFirstMessage}}` / `{{firstMessage}}`：角色开场白（ST 拼写为 charFirstMessage）
+ * - `{{charPrompt}}` / `{{charInstruction}}`：角色卡 Main / PHI 覆盖正文
+ * - `{{outlet::Name}}`：世界书 Outlet；未匹配为空串。替换结果不再扫描（禁止嵌套 outlet）
+ * - `{{time}}` / `{{date}}` / `{{datetime}}` / `{{weekday}}`：当前时间（可经 vars 覆盖）
+ * - `{{trim}}` / `{{noop}}`：删除
+ * - `{{//…}}`：注释，删除（社区预设用来写作者说明）
+ * - `{{setvar::name::value}}` / `{{getvar::name}}`：一次组装内的变量表
+ *   （setlocalvar/setglobalvar 视为 setvar；get* 同 getvar。不落盘。）
+ * - `{{lastUserMessage}}`：最近一条用户消息
+ * - `{{lastMessage}}`：最近一条真实用户或 assistant 消息（本轮宏，禁止进 standing）
+ * - `{{lastCharMessage}}`：最近一条 assistant 消息（本轮宏，禁止进 standing）
+ * - `{{random::A::B}}` / `{{pick::A,B}}` / `{{random:1,10}}`：掷骰（本轮宏，禁止进 standing）
+ * - `{{roll:1d20}}` / `{{roll d6+2}}` / `{{roll:20}}`：ST 骰子（本轮宏）；非法表达式为空串
+ * - `{{isodate}}` / `{{isotime}}`：ISO 日期与时间（本轮宏）
+ * - `{{incvar::x}}` / `{{decvar::x}}`：自增、自减并返回新值；`{{hasvar::x}}`：存在判断（true/false）
+ *   （add/inc/dec/has 的 local/global 拼写同样视为同一变量表）
+ * - `{{space}}` / `{{reverse:文本}}` / `{{banned "词"}}`（删除）/ `{{charJailbreak}}`（同 charInstruction）
+ * - `{{group}}` / `{{groupNotMuted}}`：单角色会话即角色名；`{{notChar}}`：用户名
+ *
+ * 这是组装前预处理：setvar 条目展开后变空，不进模型；getvar 处变成真正的写作规则。
+ * 不是把 ST 宏引擎原样扔给模型。
+ *
+ * 未支持的宏保留原样并回调 onUnknown。
+ *
+ * `postProcess` 逐个加工「宏解析出来的值」（对齐 ST substituteParamsExtended 的 postProcessFn）：
+ * 正则 find 的转义代入、正则 replace 的 `$` 保护都靠它，宏之外的原文不受影响。
+ */
+import type { MacroContext } from './types.js'
+
+export type { MacroContext }
+
+/** 只匹配不含花括号的最内层宏，便于 `{{setvar::x::{{char}}}}` 由内向外展开。 */
+const MACRO_RE = /\{\{\s*([^{}]+?)\s*\}\}/g
+const MAX_PASSES = 8
+/** 冻结标记必须避开本次所有文本来源，私用区字符本身也可能是角色使用的图标。 */
+function frozenOpenFor(text: string, ctx: MacroContext): string {
+  const reserved = [text, ...Object.values(ctx).filter((value): value is string => typeof value === 'string'),
+    ...Object.values(ctx.vars ?? {}), ...Object.values(ctx.outlets ?? {}), ...(ctx.store?.values() ?? []),
+    ctx.readonlyStatData === undefined ? '' : JSON.stringify(ctx.readonlyStatData)].join('\n')
+  let index = 0
+  let marker = `\uE000tavernFrozenOpen${index}\uE001`
+  while (reserved.includes(marker)) marker = `\uE000tavernFrozenOpen${++index}\uE001`
+  return marker
+}
+
+function pad2s(n: number): string {
+  return n < 10 ? `0${n}` : String(n)
+}
+
+function defaultVars(now: Date): Record<string, string> {
+  const weekdays = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday']
+  return {
+    time: `${pad2s(now.getHours())}:${pad2s(now.getMinutes())}`,
+    date: `${now.getFullYear()}-${pad2s(now.getMonth() + 1)}-${pad2s(now.getDate())}`,
+    datetime: `${now.getFullYear()}-${pad2s(now.getMonth() + 1)}-${pad2s(now.getDate())} ${pad2s(now.getHours())}:${pad2s(now.getMinutes())}`,
+    weekday: weekdays[now.getDay()]!,
+    isodate: `${now.getFullYear()}-${pad2s(now.getMonth() + 1)}-${pad2s(now.getDate())}`,
+    isotime: `${pad2s(now.getHours())}:${pad2s(now.getMinutes())}`,
+  }
+}
+
+function storeOf(ctx: MacroContext): Map<string, string> {
+  if (!ctx.store) ctx.store = new Map()
+  return ctx.store
+}
+
+function splitOnce(rest: string): [string, string] {
+  const i = rest.indexOf('::')
+  if (i < 0) return [rest, '']
+  return [rest.slice(0, i), rest.slice(i + 2)]
+}
+
+/** 同一种子每次调用生成独立流；同一 turn 多步组装应各拿一份新流。 */
+export function createTurnRandom(seed: number): () => number {
+  let a = seed >>> 0
+  return () => {
+    a = (a + 0x6d2b79f5) >>> 0
+    let t = a
+    t = Math.imul(t ^ (t >>> 15), t | 1)
+    t ^= t + Math.imul(t ^ (t >>> 7), t | 61)
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296
+  }
+}
+
+export function hashToSeed(text: string): number {
+  let h = 2166136261
+  for (let i = 0; i < text.length; i++) {
+    h ^= text.charCodeAt(i)
+    h = Math.imul(h, 16777619)
+  }
+  return h >>> 0
+}
+
+function rollChoice(options: string[], random: () => number, numericRange: boolean): string {
+  if (options.length === 0) return ''
+  if (numericRange && options.length === 2 && options.every((o) => /^-?\d+$/.test(o))) {
+    const a = Number(options[0])
+    const b = Number(options[1])
+    const lo = Math.min(a, b)
+    const hi = Math.max(a, b)
+    return String(lo + Math.floor(random() * (hi - lo + 1)))
+  }
+  return options[Math.min(options.length - 1, Math.floor(random() * options.length))]!
+}
+
+function parseChoiceMacro(inner: string): { kind: 'random' | 'pick'; options: string[] } | null {
+  const match = /^(random|pick)\s*(::|:)\s*(.*)$/i.exec(inner.trim())
+  if (!match) return null
+  const kind = match[1]!.toLowerCase() === 'pick' ? 'pick' : 'random'
+  const rest = match[3] ?? ''
+  const parts = rest.includes('::') ? rest.split('::') : rest.split(',')
+  return { kind, options: parts.map((s) => s.trim()).filter(Boolean) }
+}
+
+/** ST 骰子：NdM±K、dM 或纯数字 M（= 1dM）。个数与面数有界，非法返回 null。 */
+function rollDice(expression: string, random: () => number): string | null {
+  const match = /^(\d*)\s*d\s*(\d+)\s*([+-]\s*\d+)?$/i.exec(expression) ?? /^()(\d+)()$/.exec(expression)
+  if (!match) return null
+  const count = match[1] ? Number(match[1]) : 1
+  const sides = Number(match[2])
+  const modifier = match[3] ? Number(match[3].replace(/\s+/g, '')) : 0
+  if (!Number.isSafeInteger(count) || count < 1 || count > 100 || !Number.isSafeInteger(sides) || sides < 1 || sides > 1_000_000
+    || !Number.isSafeInteger(modifier)) return null
+  let total = modifier
+  for (let i = 0; i < count; i++) total += 1 + Math.min(sides - 1, Math.floor(random() * sides))
+  return String(total)
+}
+
+const GET_VAR_COMMANDS = ['getvar', 'getlocalvar', 'getglobalvar']
+const HAS_VAR_COMMANDS = ['hasvar', 'haslocalvar', 'hasglobalvar']
+const SET_VAR_COMMANDS = ['setvar', 'setlocalvar', 'setglobalvar']
+const ADD_VAR_COMMANDS = ['addvar', 'addlocalvar', 'addglobalvar']
+const INC_VAR_COMMANDS = ['incvar', 'inclocalvar', 'incglobalvar']
+const DEC_VAR_COMMANDS = ['decvar', 'declocalvar', 'decglobalvar']
+
+function isGetVar(inner: string): boolean {
+  return /^(getvar|getlocalvar|getglobalvar|hasvar|haslocalvar|hasglobalvar)\s*::/i.test(inner.trim())
+}
+
+function applyCommand(inner: string, ctx: MacroContext, clock: Record<string, string>): string | undefined {
+  const raw = inner.trim()
+  const lower = raw.toLowerCase()
+
+  if (lower === 'char' || lower === 'charname') return ctx.char
+  if (lower === 'user' || lower === 'username') return ctx.user
+  if (lower === 'description') return ctx.description ?? ''
+  if (lower === 'personality') return ctx.personality ?? ''
+  if (lower === 'scenario') return ctx.scenario ?? ''
+  if (lower === 'persona') return ctx.persona ?? ''
+  if (lower === 'charfirstmessage' || lower === 'firstmessage') return ctx.firstMessage ?? ''
+  if (lower === 'charprompt') return ctx.charPrompt ?? ''
+  if (lower === 'charinstruction' || lower === 'charjailbreak') return ctx.charInstruction ?? ''
+  if (lower === 'group' || lower === 'groupnotmuted') return ctx.char
+  if (lower === 'notchar') return ctx.user
+  if (lower === 'space') return ' '
+  if (/^banned\s+"[^"]*"$/i.test(raw)) return ''
+  if (lower === 'trim' || lower === 'noop' || lower === 'newline') return lower === 'newline' ? '\n' : ''
+  if (lower === 'lastmessage') return ctx.lastMessage ?? ''
+  if (lower === 'lastusermessage' || lower === 'last_user_message') {
+    return ctx.lastUserMessage ?? ''
+  }
+  if (lower === 'lastcharmessage' || lower === 'last_char_message') {
+    return ctx.lastCharMessage ?? ''
+  }
+  if (lower.startsWith('//')) return ''
+
+  // ST 同时接受 {{roll:1d6}} 与 {{roll 1d6}}。
+  const roll = /^roll(?:\s*:|\s+)\s*(.*)$/i.exec(raw)
+  if (roll) return rollDice(roll[1]!.trim(), ctx.random ?? Math.random) ?? ''
+  const reversed = /^reverse\s*:([\s\S]*)$/i.exec(raw)
+  if (reversed) return [...reversed[1]!].reverse().join('')
+
+  const choices = parseChoiceMacro(raw)
+  if (choices) return rollChoice(choices.options, ctx.random ?? Math.random, choices.kind === 'random')
+
+  if (lower.startsWith('outlet::')) {
+    const outletName = raw.slice('outlet::'.length).trim()
+    const content = ctx.outlets && Object.hasOwn(ctx.outlets, outletName) ? ctx.outlets[outletName]! : ''
+    return content
+  }
+  if (raw.startsWith('outletPromptsInjected:')) return `{{${raw}}}`
+
+  if (Object.hasOwn(clock, lower)) return clock[lower]!
+
+  const eq = lower.indexOf('::')
+  if (eq <= 0) return undefined
+  // 宏名与 :: 之间允许空格（isGetVar 同规则）：不 trim 会让 {{getvar ::x}} 在正式趟漏解析。
+  const cmd = lower.slice(0, eq).trim()
+  const rest = raw.slice(eq + 2)
+  const variableKey = splitOnce(rest)[0].trim()
+  const mvuPath = variableKey.replace(/\[(["']?)([^\]"']+)\1\]/g, '.$2').split('.')
+  if (ctx.readonlyStatData !== undefined && mvuPath[0] === 'stat_data') {
+    if ([...SET_VAR_COMMANDS, ...ADD_VAR_COMMANDS, ...INC_VAR_COMMANDS, ...DEC_VAR_COMMANDS].includes(cmd)) {
+      throw new Error('MVU stat_data 是只读快照，不能通过宏修改')
+    }
+    if (GET_VAR_COMMANDS.includes(cmd) || HAS_VAR_COMMANDS.includes(cmd)) {
+      let value: unknown = ctx.readonlyStatData
+      for (const part of mvuPath.slice(1)) {
+        if (!part || ['__proto__', 'constructor', 'prototype'].includes(part)) throw new Error('MVU 宏变量路径无效')
+        value = value && typeof value === 'object' && Object.hasOwn(value, part) ? (value as Record<string, unknown>)[part] : undefined
+      }
+      if (HAS_VAR_COMMANDS.includes(cmd)) return value === undefined ? 'false' : 'true'
+      return value === undefined ? '' : typeof value === 'string' ? value : JSON.stringify(value)
+    }
+  }
+
+  if (SET_VAR_COMMANDS.includes(cmd)) {
+    const [name, value] = splitOnce(rest)
+    const key = name.trim()
+    if (key) storeOf(ctx).set(key, value)
+    return ''
+  }
+  if (GET_VAR_COMMANDS.includes(cmd)) {
+    const key = rest.trim()
+    return storeOf(ctx).get(key) ?? ''
+  }
+  if (HAS_VAR_COMMANDS.includes(cmd)) return storeOf(ctx).has(rest.trim()) ? 'true' : 'false'
+  // 对齐 ST：incvar/decvar 返回新值（addvar 返回空串）。
+  if (INC_VAR_COMMANDS.includes(cmd) || DEC_VAR_COMMANDS.includes(cmd)) {
+    const key = rest.trim()
+    const prev = Number(storeOf(ctx).get(key) ?? '0')
+    const next = String((Number.isFinite(prev) ? prev : 0) + (INC_VAR_COMMANDS.includes(cmd) ? 1 : -1))
+    storeOf(ctx).set(key, next)
+    return next
+  }
+  if (ADD_VAR_COMMANDS.includes(cmd)) {
+    const [name, deltaRaw] = splitOnce(rest)
+    const key = name.trim()
+    const prev = Number(storeOf(ctx).get(key) ?? '0')
+    const delta = Number(deltaRaw)
+    const next = (Number.isFinite(prev) ? prev : 0) + (Number.isFinite(delta) ? delta : 0)
+    storeOf(ctx).set(key, String(next))
+    return ''
+  }
+  return undefined
+}
+
+/**
+ * 展开 text 中的宏。outlet 替换结果不二次扫描（SillyTavern：禁止嵌套 outlet）。
+ * setvar/getvar 经 MacroContext.store 在一次组装内跨条目共享。
+ *
+ * postProcess 只作用于每个宏解析出来的值（不碰模板里的原文），调用方用它做
+ * 正则转义或 `$` 保护。now 保持第三位，老调用方（只传 text/ctx 或再带 now）不受影响。
+ */
+export function expandMacros(
+  text: string,
+  ctx: MacroContext,
+  now: Date = new Date(),
+  postProcess?: (value: string) => string,
+): string {
+  if (!text.includes('{{')) return text
+  const clock = { ...defaultVars(now), ...ctx.vars }
+  const frozenOpen = frozenOpenFor(text, ctx)
+  const frozenClose = `${frozenOpen}close`
+  const thaw = (value: string): string => value.replaceAll(frozenClose, '}').replaceAll(frozenOpen, '{')
+  let current = text
+
+  const replaceInnermost = (skipGet: boolean, unknowns: string[] | null): void => {
+    current = current.replace(MACRO_RE, (raw, inner: string) => {
+      if (skipGet && isGetVar(inner)) return raw
+      const applied = applyCommand(inner, ctx, clock)
+      if (applied !== undefined) {
+        const value = postProcess ? postProcess(applied) : applied
+        // 转义等后处理先作用于原文，再冻结双向花括号，避免截断外层 setvar。
+        return inner.trim().toLowerCase().startsWith('outlet::')
+          ? value.replaceAll('{', frozenOpen).replaceAll('}', frozenClose) : value
+      }
+      unknowns?.push(inner.trim())
+      return raw
+    })
+  }
+
+  try {
+    for (let pass = 0; pass < MAX_PASSES && current.includes('{{'); pass++) {
+      const before = current
+      // 先展开 setvar/char 等，避免同串里 {{getvar}} 在写入前被读成空。
+      replaceInnermost(true, null)
+      if (current !== before) continue
+
+      const unknowns: string[] = []
+      replaceInnermost(false, unknowns)
+      if (current === before || pass === MAX_PASSES - 1) {
+        for (const name of unknowns) ctx.onUnknown?.(name)
+        break
+      }
+    }
+    return thaw(current)
+  } finally {
+    // setvar 可以捕获 outlet 内容；调用结束不能把本次内部占位符留在共享变量表里。
+    for (const [key, value] of ctx.store ?? []) {
+      if (value.includes(frozenOpen)) ctx.store!.set(key, thaw(value))
+    }
+  }
+}
+
+const IDENTITY_MACRO_RE = /\{\{\s*(char|charname|user|username)\s*\}\}/gi
+
+/**
+ * 只展开身份宏。用于开场白展示、世界书扫描、入模历史——这些地方不该跑 setvar/时钟。
+ * `{{user}}` 变成当前人设名，才能和世界书键互相命中。
+ */
+export function expandIdentityMacros(text: string, ctx: Pick<MacroContext, 'char' | 'user'>): string {
+  if (!text.includes('{{')) return text
+  return text.replace(IDENTITY_MACRO_RE, (_raw, name: string) => {
+    const k = name.toLowerCase()
+    return k === 'user' || k === 'username' ? ctx.user : ctx.char
+  })
+}
+
+/** 条目是否含本轮才稳定的宏（应进 turnContext，避免打穿 standing KV）。 */
+export function hasTurnLocalMacros(text: string): boolean {
+  if (text.includes('<%')) return true
+  // 原生 MVU 的 stat_data 是轮初剧情快照；读取它的宏和 EJS 一样不能跨轮钉死。
+  if (/\{\{\s*(?:getvar|getlocalvar|getglobalvar|hasvar|haslocalvar|hasglobalvar)\s*::\s*stat_data(?:[.\[]|\s*\}\})/i.test(text)) return true
+  return /\{\{\s*(outlet::|outletPromptsInjected:|lastusermessage|lastmessage|last_user_message|lastcharmessage|last_char_message|time|date|datetime|weekday|isodate|isotime|roll(?:\s*:|\s+\S)|random\s*:|pick\s*:)/i.test(text)
+}
+
+/** 检测尚未处理的 EJS / STscript；EJS 由隔离执行器展开，STscript 仍不执行。 */
+export function hasUnevaluatedScript(text: string): boolean {
+  return /<%[_=-]?/.test(text) || /\{%\s*(if|for|set)\b/i.test(text)
+}

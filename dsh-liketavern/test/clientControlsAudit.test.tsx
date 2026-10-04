@@ -1,0 +1,179 @@
+/** 共享表单交互回归：选项值不与占位项碰撞，过期菜单不写草稿，字段标签关联实际操作控件。 */
+import type { ReactNode } from 'react'
+import { act, create, type ReactTestRenderer } from 'react-test-renderer'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { Menu } from '@deepseek-ai/dsh-client-ui-primitives'
+import { useState } from 'react'
+import { Field, ListInput, NumInput, Select, SettingsRow, Toggle, splitRegexListText } from '../src/client/util.js'
+
+vi.mock('@deepseek-ai/dsh-client-ui-primitives', () => ({
+  Button: (props: { children?: ReactNode }) => <button>{props.children}</button>,
+  Menu: (props: { anchor?: ReactNode }) => <>{props.anchor}</>,
+  Modal: () => null, Tooltip: (props: { children?: ReactNode }) => <>{props.children}</>, Toast: () => null,
+  IconChevronDownOutlineMedium: () => null, IconSearchOutlineMedium: () => null, IconUserOutlineMedium: () => null,
+}))
+const mounted: ReactTestRenderer[] = []
+async function render(node: ReactNode) {
+  let view!: ReactTestRenderer
+  await act(async () => { view = create(node) })
+  mounted.push(view)
+  return view
+}
+afterEach(async () => { for (const view of mounted.splice(0)) await act(async () => view.unmount()) })
+
+describe('共享表单控件', () => {
+  it('空选项与名为 __empty__ 的资产可以分别选中，未知选项不触发更新', async () => {
+    const change = vi.fn()
+    const view = await render(<Select value="" onChange={change} options={[{value:'',label:'未选择'},{value:'__empty__',label:'资产'}]}/>)
+    const menu = view.root.findByType(Menu)
+    const [empty, asset] = menu.props.items as {id:string}[]
+    expect(empty!.id).not.toBe(asset!.id)
+    await act(async () => menu.props.onSelect(asset!.id))
+    expect(change).toHaveBeenLastCalledWith('__empty__')
+    await act(async () => menu.props.onSelect(empty!.id))
+    expect(change).toHaveBeenLastCalledWith('')
+    await act(async () => menu.props.onSelect('unknown'))
+    expect(change).toHaveBeenCalledTimes(2)
+  })
+
+  it('下拉已展开后控件禁用，关闭弹层且忽略迟到选择', async () => {
+    const change = vi.fn(), options = [{value:'one',label:'选项'}]
+    const view = await render(<Select value="one" onChange={change} options={options}/>)
+    await act(async () => view.root.findByType('button').props.onClick())
+    expect(view.root.findByType(Menu).props.open).toBe(true)
+    await act(async () => view.update(<Select value="one" onChange={change} options={options} disabled/>))
+    const menu = view.root.findByType(Menu)
+    expect(menu.props.open).toBe(false)
+    await act(async () => menu.props.onSelect(menu.props.items[0].id))
+    expect(change).not.toHaveBeenCalled()
+  })
+
+  it('设置行标签和说明关联开关、数值和原生文本框，显式标签仍优先', async () => {
+    const view = await render(<>
+      <SettingsRow title="启用渲染" description="渲染说明"><Toggle checked onChange={()=>{}}/></SettingsRow>
+      <SettingsRow title="保留条数"><NumInput value={200} onChange={()=>{}}/></SettingsRow>
+      <Field label="正文"><textarea defaultValue=""/></Field>
+      <Field label="外层名称"><textarea aria-label="明确的名称" defaultValue=""/></Field>
+    </>)
+    const toggle = view.root.findByProps({role:'switch'})
+    expect(view.root.findByProps({id:toggle.props['aria-labelledby']}).children).toEqual(['启用渲染'])
+    expect(view.root.findByProps({id:toggle.props['aria-describedby']}).children).toEqual(['渲染说明'])
+    const input = view.root.findByType('input')
+    expect(view.root.findByProps({id:input.props['aria-labelledby']}).children).toEqual(['保留条数'])
+    const [implicit, explicit] = view.root.findAllByType('textarea')
+    expect(view.root.findByProps({id:implicit!.props['aria-labelledby']}).children).toEqual(['正文'])
+    expect(explicit!.props['aria-label']).toBe('明确的名称')
+    expect(explicit!.props['aria-labelledby']).toBeUndefined()
+  })
+
+  it('关键词列表输入保留正在键入的分隔符与空格，外部切换值时才覆盖文本', async () => {
+    const changes: string[][] = []
+    function Form(props: { initial: string[] }) {
+      const [keys, setKeys] = useState(props.initial)
+      return <>
+        <Field label="关键词"><ListInput value={keys} onChange={(next) => { changes.push(next); setKeys(next) }}/></Field>
+        <button onClick={() => setKeys(['外部', '重置'])}>外部重置</button>
+      </>
+    }
+    const view = await render(<Form initial={['a']}/>)
+    const input = () => view.root.findByType('input')
+    expect(view.root.findByProps({id:input().props['aria-labelledby']}).children).toEqual(['关键词'])
+    const type = async (text: string) => act(async () => input().props.onChange({ target: { value: text } }))
+    await type('a,')
+    expect(input().props.value).toBe('a,')
+    await type('a, ')
+    expect(input().props.value).toBe('a, ')
+    await type('a, b')
+    expect(input().props.value).toBe('a, b')
+    expect(changes.at(-1)).toEqual(['a', 'b'])
+    await type('a, b，c\n')
+    expect(changes.at(-1)).toEqual(['a', 'b', 'c'])
+    await type('')
+    expect(input().props.value).toBe('')
+    expect(changes.at(-1)).toEqual([])
+    await act(async () => view.root.findByType('button').props.onClick())
+    expect(input().props.value).toBe('外部, 重置')
+    await type('外部, 重置,')
+    expect(input().props.value).toBe('外部, 重置,')
+  })
+
+  it.each([
+    { text: '/\\d{1,3}/, 港口', expected: ['/\\d{1,3}/', '港口'] },
+    { text: ' /[/,，]+/u , 普通，词\n/foo{1,3}/ ', expected: ['/[/,，]+/u', '普通', '词', '/foo{1,3}/'] },
+    { text: '/a\\/,b/i,/c\\[d,e/g', expected: ['/a\\/,b/i', '/c\\[d,e/g'] },
+    { text: '普通, /unfinished，另一个词\npath/a,b', expected: ['普通', '/unfinished', '另一个词', 'path/a', 'b'] },
+  ])('世界书分隔识别完整正则边界且不执行：$text', ({ text, expected }) => {
+    expect(splitRegexListText(text)).toEqual(expected)
+  })
+
+  it('正则关键词可逐字输入，普通标签仍保持逗号分项语义', async () => {
+    const changes: string[][] = []
+    function Form(props: { preserveRegex: boolean }) {
+      const [keys, setKeys] = useState<string[]>([])
+      return <ListInput value={keys} preserveRegex={props.preserveRegex} onChange={next => { changes.push(next); setKeys(next) }}/>
+    }
+    const view = await render(<Form preserveRegex />)
+    const text = '/\\d{1,3}/, 港口'
+    for (let index = 1; index <= text.length; index++) {
+      await act(async () => view.root.findByType('input').props.onChange({ target: { value: text.slice(0, index) } }))
+      expect(view.root.findByType('input').props.value).toBe(text.slice(0, index))
+    }
+    expect(changes.at(-1)).toEqual(['/\\d{1,3}/', '港口'])
+    await act(async () => view.update(<Form preserveRegex={false}/>))
+    await act(async () => view.root.findByType('input').props.onChange({ target: { value: '/a,b/, 标签' } }))
+    expect(changes.at(-1)).toEqual(['/a', 'b/', '标签'])
+  })
+
+  it('数字字段可以清空后重输，不把输入过程中的空值提交为 0 或夹回最小值', async () => {
+    const changes: number[] = []
+    function Form() {
+      const [value, setValue] = useState(200)
+      return <NumInput value={value} onChange={(next) => { changes.push(next); setValue(Math.max(1, Math.round(next))) }} />
+    }
+    const view = await render(<Form />)
+    const input = () => view.root.findByType('input')
+    await act(async () => input().props.onChange({ target: { value: '' } }))
+    expect(input().props.value).toBe('')
+    expect(changes).toEqual([])
+    await act(async () => input().props.onChange({ target: { value: '8' } }))
+    expect(Number(input().props.value)).toBe(8)
+    expect(changes).toEqual([8])
+  })
+
+  it('未完成的数字离开焦点时恢复最后有效值，外部重置仍及时反映', async () => {
+    const change = vi.fn()
+    const view = await render(<NumInput value={0.75} onChange={change} />)
+    const input = () => view.root.findByType('input')
+    await act(async () => input().props.onChange({ target: { value: '' } }))
+    expect(input().props.value).toBe('')
+    await act(async () => input().props.onBlur())
+    expect(Number(input().props.value)).toBe(0.75)
+    expect(change).not.toHaveBeenCalled()
+    await act(async () => input().props.onChange({ target: { value: '' } }))
+    await act(async () => view.update(<NumInput value={0.9} onChange={change} />))
+    expect(Number(input().props.value)).toBe(0.9)
+    await act(async () => input().props.onChange({ target: { value: '1e999' } }))
+    expect(change).not.toHaveBeenCalled()
+    await act(async () => input().props.onBlur())
+    expect(Number(input().props.value)).toBe(0.9)
+  })
+
+  it('多位数的第一位低于最小值时仍可继续输入，失焦再显示限幅结果', async () => {
+    function Form() {
+      const [value, setValue] = useState(200)
+      return <NumInput value={value} onChange={(next) => setValue(Math.max(10, Math.round(next)))} />
+    }
+    const view = await render(<Form />)
+    const input = () => view.root.findByType('input')
+    for (const text of ['', '2', '25']) {
+      await act(async () => input().props.onChange({ target: { value: text } }))
+      expect(input().props.value).toBe(text)
+    }
+    await act(async () => input().props.onBlur())
+    expect(Number(input().props.value)).toBe(25)
+    await act(async () => input().props.onChange({ target: { value: '1' } }))
+    expect(input().props.value).toBe('1')
+    await act(async () => input().props.onBlur())
+    expect(Number(input().props.value)).toBe(10)
+  })
+})
